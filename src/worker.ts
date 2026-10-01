@@ -1,5 +1,6 @@
 /// <reference lib="webworker" />
 import { blurImage } from './core/blur';
+import { applyGroups, countLabels } from './core/palette';
 import { quantize, type QuantizeResult } from './core/quantize';
 import type { RasterImage } from './core/types';
 import type { PipelineParams, PipelineResult, WorkerRequest, WorkerResponse } from './protocol';
@@ -24,11 +25,21 @@ function run(id: number, params: PipelineParams): PipelineResult {
     quantCache = { key: qKey, result: quantize(src, { k: q.colors, seed: q.seed }) };
   }
   const quant = quantCache.result;
+  const k = quant.centroids.length;
+  // Palette merges. A grouping made for a different clustering is ignored.
+  const groups =
+    params.palette.quantKey === qKey && params.palette.groups.length === k
+      ? params.palette.groups
+      : [...Array(k).keys()];
+  const entryCount = k === 0 ? 0 : Math.max(...groups) + 1;
+  const labels = applyGroups(quant.labels, groups);
   return {
     width: quant.width,
     height: quant.height,
     quant: { key: qKey, centroids: quant.centroids, counts: quant.counts },
-    labels: quant.labels.slice(),
+    entryCount,
+    labels,
+    counts: countLabels(labels, entryCount),
   };
 }
 

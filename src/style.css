@@ -133,3 +133,15 @@ footer.foot {
   main.panes { grid-template-columns: 1fr; }
   .view { height: 60vh; }
 }
+
+.palette { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.swatch-row {
+  display: grid; grid-template-columns: 18px 30px 1fr auto 24px; gap: 8px; align-items: center;
+  padding: 3px 4px; border-radius: 6px;
+}
+.swatch-row:hover { background: var(--panel-2); }
+.swatch { width: 30px; height: 22px; padding: 0; border-radius: 4px; border: 1px solid var(--border); }
+.swatch-row .hex { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.swatch-row .pct { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+.tag { font-family: system-ui, sans-serif; font-size: 10px; color: var(--accent); margin-left: 4px; }
+button.mini { padding: 0 4px; font-size: 12px; line-height: 20px; }

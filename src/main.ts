@@ -1,5 +1,6 @@
 import './style.css';
-import type { RGB } from './core/color';
+import { hexToRgb, type RGB } from './core/color';
+import { clusterGroups, entriesFromClusters, mergeEntries, resolveColors, type PaletteEntry } from './core/palette';
 import { VOID } from './core/types';
 import { loadImage, type LoadedImage } from './imageLoader';
 import type { PipelineParams, PipelineResult } from './protocol';
@@ -37,6 +38,16 @@ app.innerHTML = `
         <button id="reseed-btn" title="Re-run clustering with a new random seed">Re-cluster (new seed)</button>
         <span class="hint">seed <span id="seed-out"></span></span>
       </div>
+    </section>
+    <section>
+      <h2>Palette</h2>
+      <div id="palette" class="palette"></div>
+      <div class="row">
+        <button id="merge-btn" disabled title="Merge the checked colors into one">Merge selected</button>
+        <button id="reset-palette-btn" title="Undo merges and color overrides">Reset</button>
+      </div>
+      <label class="check" style="margin-top:8px"><input id="force-bw" type="checkbox" /> Force darkest/lightest to pure black/white</label>
+      <div class="hint">Click a swatch to override its output color. Overrides don't change which pixels belong to it.</div>
     </section>
     <section>
       <div id="status" class="status"></div>
@@ -79,6 +90,11 @@ interface State {
   blur: number;
   seed: number;
   result: PipelineResult | null;
+  /** Quantize key the palette entries belong to. */
+  quantKey: string;
+  entries: PaletteEntry[];
+  selected: Set<number>;
+  forceBW: boolean;
 }
 
 const state: State = {
@@ -87,6 +103,10 @@ const state: State = {
   blur: 0,
   seed: 1,
   result: null,
+  quantKey: '',
+  entries: [],
+  selected: new Set(),
+  forceBW: false,
 };
 
 // ------------------------------------------------------------- worker -----
@@ -98,6 +118,12 @@ client.onProgress = (stage) => {
 client.onError = (message) => setStatus(message, 'error');
 client.onResult = (result) => {
   state.result = result;
+  if (result.quant.key !== state.quantKey) {
+    // New clustering: palette edits from the previous one no longer apply.
+    state.quantKey = result.quant.key;
+    state.entries = entriesFromClusters(result.quant.centroids);
+    state.selected.clear();
+  }
   renderResult();
 };
 
@@ -110,6 +136,7 @@ function schedule(delay = 200): void {
 function buildParams(): PipelineParams {
   return {
     quantize: { colors: state.colors, blur: state.blur, seed: state.seed },
+    palette: { quantKey: state.quantKey, groups: clusterGroups(state.entries, state.result?.quant.centroids.length ?? 0) },
   };
 }
 
@@ -127,13 +154,28 @@ $('zoom-out').addEventListener('click', () => viewports.zoomBy(0.8));
 $('zoom-fit').addEventListener('click', () => viewports.fit());
 
 // ------------------------------------------------------------- render -----
+function paletteHex(): string[] {
+  return resolveColors(state.entries, state.forceBW);
+}
+
 function paletteColors(): RGB[] {
-  return state.result?.quant.centroids ?? [];
+  return paletteHex().map(hexToRgb);
+}
+
+/** True when the last result's labels match the current palette entries. */
+function resultInSync(): boolean {
+  const r = state.result;
+  return !!r && r.quant.key === state.quantKey && r.entryCount === state.entries.length;
 }
 
 function renderResult(): void {
   const r = state.result;
-  if (!r) return;
+  if (!r || !resultInSync()) return;
+  renderRaster(r);
+  renderPalette();
+}
+
+function renderRaster(r: PipelineResult): void {
   const canvas = $<HTMLCanvasElement>('raster-canvas');
   canvas.width = r.width;
   canvas.height = r.height;
@@ -151,7 +193,7 @@ function renderResult(): void {
     d[i * 4 + 3] = 255;
   }
   g.putImageData(img, 0, 0);
-  const k = colors.length;
+  const k = r.quant.centroids.length;
   setStatus(
     k < state.colors
       ? `Image only has ${k} distinct color${k === 1 ? '' : 's'}; using ${k}.`
@@ -160,6 +202,50 @@ function renderResult(): void {
         : '',
     k < state.colors ? 'warn' : 'info',
   );
+}
+
+function renderPalette(): void {
+  const el = $('palette');
+  const r = resultInSync() ? state.result : null;
+  const hex = paletteHex();
+  const total = r ? r.counts.reduce((a, b) => a + b, 0) : 0;
+  el.innerHTML = '';
+  state.entries.forEach((e, i) => {
+    const row = document.createElement('div');
+    row.className = 'swatch-row';
+    const pct = total > 0 && r ? (100 * (r.counts[i] ?? 0)) / total : 0;
+    const overridden = e.override !== null;
+    row.innerHTML = `
+      <input type="checkbox" aria-label="Select color ${i + 1}" ${state.selected.has(i) ? 'checked' : ''} />
+      <button class="swatch" title="Click to override the output color" style="background:${hex[i]}"></button>
+      <input type="color" value="${hex[i].toLowerCase()}" hidden />
+      <span class="hex">${hex[i]}${overridden ? ' <span class="tag">edited</span>' : ''}</span>
+      <span class="pct">${pct < 0.1 && pct > 0 ? '<0.1' : pct.toFixed(1)}%</span>
+      <button class="mini" title="Revert to cluster color" ${overridden ? '' : 'hidden'}>↺</button>`;
+    const [check, swatch, picker, , , revert] = [...row.children] as HTMLElement[];
+    check.addEventListener('change', () => {
+      if ((check as HTMLInputElement).checked) state.selected.add(i);
+      else state.selected.delete(i);
+      updateMergeButton();
+    });
+    swatch.addEventListener('click', () => (picker as HTMLInputElement).click());
+    picker.addEventListener('input', () => {
+      e.override = (picker as HTMLInputElement).value.toUpperCase();
+      (swatch as HTMLElement).style.background = e.override;
+      if (state.result) renderRaster(state.result);
+    });
+    picker.addEventListener('change', () => renderResult());
+    revert.addEventListener('click', () => {
+      e.override = null;
+      renderResult();
+    });
+    el.appendChild(row);
+  });
+  updateMergeButton();
+}
+
+function updateMergeButton(): void {
+  $<HTMLButtonElement>('merge-btn').disabled = state.selected.size < 2;
 }
 
 function setStatus(text: string, kind: 'info' | 'warn' | 'error' = 'info'): void {
@@ -188,6 +274,27 @@ function bindRange(id: string, fmt: (v: number) => string, apply: (v: number) =>
 
 const setColors = bindRange('colors', (v) => String(v), (v) => (state.colors = v));
 const setBlur = bindRange('blur', (v) => (v === 0 ? 'off' : `${v} px`), (v) => (state.blur = v));
+$('merge-btn').addEventListener('click', () => {
+  const q = state.result?.quant;
+  if (!q || state.selected.size < 2) return;
+  state.entries = mergeEntries(state.entries, [...state.selected], q.centroids, q.counts);
+  state.selected.clear();
+  renderPalette();
+  schedule(0);
+});
+$('reset-palette-btn').addEventListener('click', () => {
+  const q = state.result?.quant;
+  if (!q) return;
+  state.entries = entriesFromClusters(q.centroids);
+  state.selected.clear();
+  renderPalette();
+  schedule(0);
+});
+$<HTMLInputElement>('force-bw').addEventListener('change', (e) => {
+  state.forceBW = (e.target as HTMLInputElement).checked;
+  renderResult();
+});
+
 $('seed-out').textContent = String(state.seed);
 $('reseed-btn').addEventListener('click', () => {
   state.seed = (Math.random() * 0xffffffff) >>> 0 || 1;

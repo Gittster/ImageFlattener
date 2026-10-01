@@ -6,8 +6,16 @@ export interface QuantizeParams {
   seed: number;
 }
 
+export interface PaletteParams {
+  /** Quantize key the grouping was made for; ignored if it doesn't match. */
+  quantKey: string;
+  /** cluster index -> palette entry index */
+  groups: number[];
+}
+
 export interface PipelineParams {
   quantize: QuantizeParams;
+  palette: PaletteParams;
 }
 
 export interface QuantizeInfo {
@@ -20,8 +28,12 @@ export interface PipelineResult {
   width: number;
   height: number;
   quant: QuantizeInfo;
+  /** Number of palette entries the labels refer to. */
+  entryCount: number;
   /** Final label map (after palette merges and cleanup). */
   labels: Uint8Array;
+  /** Pixel count per palette entry in the final label map. */
+  counts: number[];
 }
 
 export type WorkerRequest =
