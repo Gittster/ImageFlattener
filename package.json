@@ -1,0 +1,25 @@
+{
+  "name": "image-flattener",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Client-side image flattener: N-color PNG + layered SVG for multi-color 3D printing",
+  "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^8.0.0",
+    "vitest": "^4.1.11"
+  }
+}
