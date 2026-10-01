@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 import { blurImage } from './core/blur';
-import { despeckle, findThinFeatures, modeFilter } from './core/cleanup';
+import { despeckle, modeFilter, thinFeatureSteps, type ThinFeatures } from './core/cleanup';
 import { applyGroups, countLabels } from './core/palette';
 import { quantize, type QuantizeResult } from './core/quantize';
 import { buildLayerPaths } from './core/svg';
@@ -14,9 +14,17 @@ declare const self: DedicatedWorkerGlobalScope;
 let image: RasterImage | null = null;
 let imageVersion = 0;
 let quantCache: { key: string; result: QuantizeResult } | null = null;
-let cleanCache: { key: string; map: LabelMap; thin: { count: number; mask: Uint8Array } } | null = null;
+let cleanCache: { key: string; map: LabelMap; minFeaturePx: number; thin: ThinFeatures | null } | null = null;
+/** Incremented on every incoming message; background work stops when it changes. */
+let messageSerial = 0;
 let graphCache: { key: string; graph: EdgeGraph } | null = null;
 let vectorCache: { key: string; result: VectorResult } | null = null;
+
+class StaleRequest extends Error {
+  constructor() {
+    super('stale');
+  }
+}
 
 function post(msg: WorkerResponse, transfer: Transferable[] = []): void {
   self.postMessage(msg, transfer);
@@ -24,6 +32,7 @@ function post(msg: WorkerResponse, transfer: Transferable[] = []): void {
 
 function run(id: number, params: PipelineParams): PipelineResult {
   if (!image) throw new Error('No image loaded');
+  if (params.imageVersion !== imageVersion) throw new StaleRequest();
   const q = params.quantize;
   const qKey = JSON.stringify([imageVersion, q.colors, q.blur, q.seed]);
   if (!quantCache || quantCache.key !== qKey) {
@@ -47,8 +56,7 @@ function run(id: number, params: PipelineParams): PipelineResult {
     let map: LabelMap = { width: quant.width, height: quant.height, labels: applyGroups(quant.labels, groups) };
     if (c.modeFilter > 0) map = modeFilter(map, c.modeFilter);
     if (c.despeckleArea > 1) map = despeckle(map, c.despeckleArea);
-    post({ type: 'progress', id, stage: 'Checking feature sizes…' });
-    cleanCache = { key: cKey, map, thin: findThinFeatures(map, c.minFeaturePx) };
+    cleanCache = { key: cKey, map, minFeaturePx: c.minFeaturePx, thin: null };
   }
   const labels = cleanCache.map.labels;
 
@@ -74,14 +82,16 @@ function run(id: number, params: PipelineParams): PipelineResult {
     vector = vectorCache.result;
   }
   return {
+    imageVersion,
     width: quant.width,
     height: quant.height,
     quant: { key: qKey, centroids: quant.centroids, counts: quant.counts },
     entryCount,
     labels: labels.slice(),
     counts: countLabels(labels, entryCount),
-    thinCount: cleanCache.thin.count,
-    thinMask: cleanCache.thin.mask.slice(),
+    cleanKey: cKey,
+    thinCount: cleanCache.thin ? cleanCache.thin.count : -1,
+    thinMask: cleanCache.thin ? cleanCache.thin.mask.slice() : new Uint8Array(0),
     vector,
   };
 }
@@ -122,11 +132,34 @@ async function renderPng(id: number, ow: number, oh: number, colors: (RGB | null
   }
 }
 
+/**
+ * Thin-feature detection is the slowest step, so it runs after the result has
+ * been posted, one color per task, and is abandoned when a new message arrives.
+ */
+function computeThinInBackground(): void {
+  const cache = cleanCache;
+  if (!cache || cache.thin) return;
+  const serial = messageSerial;
+  const steps = thinFeatureSteps(cache.map, cache.minFeaturePx);
+  const step = (): void => {
+    if (serial !== messageSerial || cleanCache !== cache) return;
+    const r = steps.next();
+    if (!r.done) {
+      setTimeout(step, 0);
+      return;
+    }
+    cache.thin = r.value;
+    post({ type: 'thin', cleanKey: cache.key, count: r.value.count, mask: r.value.mask.slice() });
+  };
+  setTimeout(step, 0);
+}
+
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data;
+  messageSerial++;
   if (msg.type === 'image') {
     image = { width: msg.width, height: msg.height, data: msg.data };
-    imageVersion++;
+    imageVersion = msg.version;
     quantCache = null;
     cleanCache = null;
     graphCache = null;
@@ -140,7 +173,9 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   try {
     const result = run(msg.id, msg.params);
     post({ type: 'result', id: msg.id, result }, [result.labels.buffer, result.thinMask.buffer]);
+    computeThinInBackground();
   } catch (err) {
-    post({ type: 'error', id: msg.id, message: err instanceof Error ? err.message : String(err) });
+    if (err instanceof StaleRequest) post({ type: 'error', id: msg.id, message: '' });
+    else post({ type: 'error', id: msg.id, message: err instanceof Error ? err.message : String(err) });
   }
 };

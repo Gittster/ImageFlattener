@@ -263,43 +263,49 @@ export interface ThinFeatures {
  * ordinary corners don't count.
  */
 export function findThinFeatures(map: LabelMap, minWidth: number): ThinFeatures {
+  const steps = thinFeatureSteps(map, minWidth);
+  for (;;) {
+    const r = steps.next();
+    if (r.done) return r.value;
+  }
+}
+
+/**
+ * Incremental version of findThinFeatures: yields after each color so the
+ * caller can interleave other work (or abandon the computation).
+ */
+export function* thinFeatureSteps(map: LabelMap, minWidth: number): Generator<void, ThinFeatures, void> {
   const { width: w, height: h, labels } = map;
   const mask = new Uint8Array(w * h);
   const r = minWidth / 2;
   if (r <= 0.5) return { count: 0, mask };
-  const present = new Set<number>();
-  for (let i = 0; i < labels.length; i++) present.add(labels[i]);
-  present.delete(VOID);
+  // Bounding boxes of all labels in one pass.
+  const x0 = new Int32Array(256).fill(w), y0 = new Int32Array(256).fill(h);
+  const x1 = new Int32Array(256).fill(-1), y1 = new Int32Array(256).fill(-1);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const l = labels[y * w + x];
+      if (x < x0[l]) x0[l] = x;
+      if (x > x1[l]) x1[l] = x;
+      if (y < y0[l]) y0[l] = y;
+      if (y > y1[l]) y1[l] = y;
+    }
+  }
   const pad = Math.ceil(r) + 2;
   const residue = new Uint8Array(w * h);
-  for (const l of present) {
-    // Bounding box of this label.
-    let x0 = w, y0 = h, x1 = -1, y1 = -1;
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        if (labels[y * w + x] === l) {
-          if (x < x0) x0 = x;
-          if (x > x1) x1 = x;
-          if (y < y0) y0 = y;
-          if (y > y1) y1 = y;
-        }
-      }
-    }
-    const bw = x1 - x0 + 1 + pad * 2;
-    const bh = y1 - y0 + 1 + pad * 2;
-    const inside = new Uint8Array(bw * bh);
+  const thr = (r + 0.5) * (r + 0.5);
+  // Pixel centers lie on an integer grid, so allow half a pixel of slack.
+  const r2 = (r + 0.5) * (r + 0.5);
+  for (let l = 0; l < 256; l++) {
+    if (l === VOID || x1[l] < 0) continue;
+    const bw = x1[l] - x0[l] + 1 + pad * 2;
+    const bh = y1[l] - y0[l] + 1 + pad * 2;
     const outside = new Uint8Array(bw * bh).fill(1);
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        if (labels[y * w + x] === l) {
-          const i = (y - y0 + pad) * bw + (x - x0 + pad);
-          inside[i] = 1;
-          outside[i] = 0;
-        }
-      }
+    for (let y = y0[l]; y <= y1[l]; y++) {
+      const row = (y - y0[l] + pad) * bw + pad - x0[l];
+      for (let x = x0[l]; x <= x1[l]; x++) if (labels[y * w + x] === l) outside[row + x] = 0;
     }
     const dOut = edt(outside, bw, bh);
-    const thr = (r + 0.5) * (r + 0.5);
     const eroded = new Uint8Array(bw * bh);
     let any = false;
     for (let i = 0; i < eroded.length; i++) {
@@ -309,18 +315,17 @@ export function findThinFeatures(map: LabelMap, minWidth: number): ThinFeatures 
       }
     }
     const dEro = any ? edt(eroded, bw, bh) : null;
-    // Pixel centers lie on an integer grid, so allow half a pixel of slack.
-    const r2 = (r + 0.5) * (r + 0.5);
-    for (let y = y0; y <= y1; y++) {
-      for (let x = x0; x <= x1; x++) {
-        const i = (y - y0 + pad) * bw + (x - x0 + pad);
-        if (inside[i] && (!dEro || dEro[i] > r2)) residue[y * w + x] = 1;
+    for (let y = y0[l]; y <= y1[l]; y++) {
+      const row = (y - y0[l] + pad) * bw + pad - x0[l];
+      for (let x = x0[l]; x <= x1[l]; x++) {
+        const i = row + x;
+        if (!outside[i] && (!dEro || dEro[i] > r2)) residue[y * w + x] = 1;
       }
     }
+    yield;
   }
   // Group residue pixels into features (4-connected) and keep the big ones.
-  const resMap: LabelMap = { width: w, height: h, labels: residue };
-  const comps = connectedComponents(resMap);
+  const comps = connectedComponents({ width: w, height: h, labels: residue });
   const minArea = minWidth * minWidth;
   let count = 0;
   for (let c = 0; c < comps.count; c++) {

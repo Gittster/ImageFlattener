@@ -15,6 +15,7 @@ export class WorkerClient {
   onResult: (r: PipelineResult) => void = () => {};
   onProgress: (stage: string | null) => void = () => {};
   onError: (message: string) => void = () => {};
+  onThin: (cleanKey: string, count: number, mask: Uint8Array) => void = () => {};
 
   constructor() {
     this.worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
@@ -26,8 +27,8 @@ export class WorkerClient {
     };
   }
 
-  setImage(width: number, height: number, data: Uint8ClampedArray): void {
-    const msg: WorkerRequest = { type: 'image', width, height, data };
+  setImage(version: number, width: number, height: number, data: Uint8ClampedArray): void {
+    const msg: WorkerRequest = { type: 'image', version, width, height, data };
     this.worker.postMessage(msg, [data.buffer]);
   }
 
@@ -58,6 +59,10 @@ export class WorkerClient {
   }
 
   private handle(msg: WorkerResponse): void {
+    if (msg.type === 'thin') {
+      this.onThin(msg.cleanKey, msg.count, msg.mask);
+      return;
+    }
     const png = this.pngRequests.get(msg.id);
     if (png) {
       this.pngRequests.delete(msg.id);
@@ -80,7 +85,7 @@ export class WorkerClient {
     }
     this.onProgress(null);
     if (msg.type === 'result') this.onResult(msg.result);
-    else if (msg.type === 'error') this.onError(msg.message);
+    else if (msg.type === 'error' && msg.message) this.onError(msg.message);
   }
 }
 

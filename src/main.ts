@@ -84,6 +84,7 @@ app.innerHTML = `
         <div class="label"><span>Min feature size</span><span class="value" id="min-feature-info"></span></div>
         <div class="row"><input id="feature-mult" type="number" min="0.5" max="5" step="0.1" value="1.5" aria-label="Minimum feature size multiplier" /> × nozzle</div>
       </div>
+      <div class="hint" id="resolution-info"></div>
     </section>
     <section>
       <h2>Vector</h2>
@@ -166,6 +167,9 @@ const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) 
 // ---------------------------------------------------------------- state ---
 interface State {
   image: LoadedImage | null;
+  /** Incremented for every loaded image. */
+  imageVersion: number;
+  loading: boolean;
   colors: number;
   blur: number;
   seed: number;
@@ -196,6 +200,8 @@ interface State {
 
 const state: State = {
   image: null,
+  imageVersion: 0,
+  loading: false,
   colors: 4,
   blur: 0,
   seed: 1,
@@ -251,12 +257,19 @@ function derived(): Derived {
 
 // ------------------------------------------------------------- worker -----
 const client = new WorkerClient();
+let workerStage: string | null = null;
+function updateBusy(): void {
+  const text = state.loading ? 'Loading image…' : (workerStage ?? (runQueued && state.image ? 'Updating…' : null));
+  $('busy').classList.toggle('on', text !== null);
+  if (text) $('busy-text').textContent = text;
+}
 client.onProgress = (stage) => {
-  $('busy').classList.toggle('on', stage !== null);
-  if (stage) $('busy-text').textContent = stage;
+  workerStage = stage;
+  updateBusy();
 };
 client.onError = (message) => setStatus(message, 'error');
 client.onResult = (result) => {
+  if (result.imageVersion !== state.imageVersion || state.loading) return; // stale
   state.result = result;
   if (result.quant.key !== state.quantKey) {
     // New clustering: palette edits from the previous one no longer apply.
@@ -268,15 +281,27 @@ client.onResult = (result) => {
   renderResult();
 };
 
+client.onThin = (cleanKey, count, mask) => {
+  const r = state.result;
+  if (!r || r.cleanKey !== cleanKey) return;
+  r.thinCount = count;
+  r.thinMask = mask;
+  renderThin(r);
+};
+
 let debounceTimer = 0;
+let runQueued = false;
 function schedule(delay = 200): void {
   window.clearTimeout(debounceTimer);
+  runQueued = true;
+  updateBusy();
   debounceTimer = window.setTimeout(runPipeline, delay);
 }
 
 function buildParams(): PipelineParams {
   const d = derived();
   return {
+    imageVersion: state.imageVersion,
     cleanup: { modeFilter: state.modeFilter, despeckleArea: d.despeckleArea, minFeaturePx: d.minFeaturePx },
     quantize: { colors: state.colors, blur: state.blur, seed: state.seed },
     palette: { quantKey: state.quantKey, groups: clusterGroups(state.entries, state.result?.quant.centroids.length ?? 0) },
@@ -292,7 +317,9 @@ function buildParams(): PipelineParams {
 }
 
 function runPipeline(): void {
-  if (!state.image) return;
+  runQueued = false;
+  updateBusy();
+  if (!state.image || state.loading) return;
   client.process(buildParams());
 }
 
@@ -427,7 +454,7 @@ function renderVector(): void {
 
 // --------------------------------------------------------------- export ---
 function updateExportButtons(): void {
-  const ok = !!svgLayers();
+  const ok = !state.loading && !!svgLayers();
   for (const id of ['export-svg', 'export-zip', 'export-png', 'export-json']) $<HTMLButtonElement>(id).disabled = !ok;
   const d = derived();
   const size = exportPngSize();
@@ -530,7 +557,7 @@ function settingsJson(): string {
       bleedMm: state.mode === 'cutout' ? state.bleedMm : 0,
       background: state.background ? state.backgroundColor : null,
     },
-    thinFeatureWarnings: r?.thinCount ?? 0,
+    thinFeatureWarnings: r && r.thinCount >= 0 ? r.thinCount : null,
   };
   return JSON.stringify(doc, null, 2) + '\n';
 }
@@ -538,7 +565,10 @@ function settingsJson(): string {
 function renderThin(r: PipelineResult): void {
   const el = $('thin-warning');
   const d = derived();
-  if (r.thinCount > 0) {
+  if (r.thinCount < 0) {
+    el.textContent = 'Checking feature sizes…';
+    el.className = 'status';
+  } else if (r.thinCount > 0) {
     el.textContent = `⚠ ${r.thinCount} feature${r.thinCount === 1 ? ' is' : 's are'} thinner than ${d.minFeatureMm.toFixed(2)} mm.`;
     el.className = 'status warn';
   } else {
@@ -546,8 +576,9 @@ function renderThin(r: PipelineResult): void {
     el.className = 'status';
   }
   const c = $<HTMLCanvasElement>('thin-canvas');
-  c.hidden = !state.showThin;
-  if (!state.showThin) return;
+  const ready = r.thinMask.length === r.width * r.height;
+  c.hidden = !state.showThin || state.view !== 'raster' || !ready;
+  if (c.hidden) return;
   c.width = r.width;
   c.height = r.height;
   const g = c.getContext('2d')!;
@@ -570,6 +601,13 @@ function renderDerived(): void {
   mmInput.disabled = state.despeckleAuto || !state.despeckle;
   if (state.despeckleAuto) mmInput.value = d.minFeatureMm.toFixed(2);
   $('despeckle-info').textContent = state.despeckle && state.image ? `≈ ${Math.round(d.despeckleArea)} px²` : '';
+  $('tolerance-out').textContent = `${state.tolerance} px` + (state.image ? ` ≈ ${(state.tolerance / d.pxPerMm).toFixed(2)} mm` : '');
+  const mmPerPx = 1 / d.pxPerMm;
+  $('resolution-info').textContent = state.image
+    ? `Working image: ${state.image.working.width} × ${state.image.working.height} px → ${mmPerPx.toFixed(3)} mm per pixel.` +
+      (mmPerPx > state.nozzleMm ? ' Pixels are larger than the nozzle; consider a smaller print or a higher-resolution image.' : '')
+    : '';
+  if (state.result) updateExportButtons();
 }
 
 function renderRaster(r: PipelineResult): void {
@@ -592,10 +630,10 @@ function renderRaster(r: PipelineResult): void {
   g.putImageData(img, 0, 0);
   const k = r.quant.centroids.length;
   setStatus(
-    k < state.colors
-      ? `Image only has ${k} distinct color${k === 1 ? '' : 's'}; using ${k}.`
-      : k === 0
-        ? 'Image is fully transparent.'
+    k === 0
+      ? 'The image is fully transparent; there is nothing to flatten.'
+      : k < state.colors
+        ? `Image only has ${k} distinct color${k === 1 ? '' : 's'}; using ${k}.`
         : '',
     k < state.colors ? 'warn' : 'info',
   );
@@ -730,7 +768,7 @@ bindCheck('despeckle-auto', (v) => {
   if (!v) state.despeckleMm = Number($<HTMLInputElement>('despeckle-mm').value) || state.despeckleMm;
 });
 bindCheck('show-thin', (v) => (state.showThin = v), false);
-bindRange('tolerance', (v) => `${v} px`, (v) => (state.tolerance = v));
+bindRange('tolerance', (v) => `${v} px` + (state.image ? ` ≈ ${(v / derived().pxPerMm).toFixed(2)} mm` : ''), (v) => (state.tolerance = v));
 bindCheck('curves', (v) => (state.curves = v));
 bindRange('bleed', (v) => (v === 0 ? 'off' : `${v.toFixed(2)} mm`), (v) => (state.bleedMm = v));
 for (const b of $('mode-seg').querySelectorAll<HTMLButtonElement>('button')) {
@@ -767,13 +805,15 @@ $('reseed-btn').addEventListener('click', () => {
 
 // ------------------------------------------------------------- loading ----
 async function openBlob(blob: Blob, name: string): Promise<void> {
+  state.loading = true;
+  state.result = null;
+  updateExportButtons();
+  updateBusy();
   try {
-    $('busy').classList.add('on');
-    $('busy-text').textContent = 'Loading image…';
     const img = await loadImage(blob, name);
     if (state.image) URL.revokeObjectURL(state.image.url);
     state.image = img;
-    state.result = null;
+    state.imageVersion++;
     const { width: w, height: h } = img.working;
     const orig = $<HTMLImageElement>('original-img');
     orig.src = img.url;
@@ -789,10 +829,14 @@ async function openBlob(blob: Blob, name: string): Promise<void> {
     $('image-info').textContent =
       `${name} · ${img.originalWidth}×${img.originalHeight}` + (w !== img.originalWidth ? ` (working ${w}×${h})` : '');
     // Copy: the buffer is transferred to the worker.
-    client.setImage(w, h, img.working.data.slice());
+    client.setImage(state.imageVersion, w, h, img.working.data.slice());
+    state.loading = false;
+    updateBusy();
+    renderVector();
     schedule(0);
   } catch (err) {
-    $('busy').classList.remove('on');
+    state.loading = false;
+    updateBusy();
     setStatus(err instanceof Error ? err.message : String(err), 'error');
   }
 }

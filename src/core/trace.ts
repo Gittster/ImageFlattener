@@ -139,18 +139,30 @@ export function traceEdges(map: LabelMap, opts: TraceOptions): EdgeGraph {
     }
     // Points: crack midpoints (turns 1-pixel staircases into diagonals), plus
     // real corner vertices between two long runs and at image corners.
+    // Corner vertices are locked: simplification never removes them.
     const pts: number[] = [];
-    if (!closed) pts.push(sx, sy);
+    const locked: boolean[] = [];
+    if (!closed) {
+      pts.push(sx, sy);
+      locked.push(true);
+    }
     let vx = sx, vy = sy;
     for (let i = 0; i < n; i++) {
       const di = dirs[i];
       pts.push(vx + DX[di] * 0.5, vy + DY[di] * 0.5);
+      locked.push(false);
       vx += DX[di];
       vy += DY[di];
       const j = i + 1 < n ? i + 1 : closed ? 0 : -1;
-      if (j >= 0 && dirs[j] !== di && ((run[i] >= 2 && run[j] >= 2) || isImageCorner(vx, vy))) pts.push(vx, vy);
+      if (j >= 0 && dirs[j] !== di && ((run[i] >= 2 && run[j] >= 2) || isImageCorner(vx, vy))) {
+        pts.push(vx, vy);
+        locked.push(true);
+      }
     }
-    if (!closed) pts.push(x, y);
+    if (!closed) {
+      pts.push(x, y);
+      locked.push(true);
+    }
     const lastD = dirs[n - 1];
     edges.push({
       left,
@@ -160,7 +172,7 @@ export function traceEdges(map: LabelMap, opts: TraceOptions): EdgeGraph {
       v1: closed ? -1 : y * W1 + x,
       d0: [DX[sd], DY[sd]],
       d1: [DX[lastD], DY[lastD]],
-      seg: buildSegments(pts, closed, opts.tolerance, opts.curves, cornerCos),
+      seg: buildSegments(pts, locked, closed, opts.tolerance, opts.curves, cornerCos),
     });
   };
 
@@ -222,7 +234,43 @@ export function douglasPeucker(pts: number[], tol: number): number[] {
   return out;
 }
 
-function simplifyClosed(pts: number[], tol: number): number[] {
+/** Douglas-Peucker applied separately between consecutive locked points. */
+function simplifyLocked(pts: number[], locked: boolean[], tol: number): { pts: number[]; locked: boolean[] } {
+  const n = locked.length;
+  const outPts: number[] = [pts[0], pts[1]];
+  const outLocked: boolean[] = [locked[0]];
+  let a = 0;
+  for (let b = 1; b < n; b++) {
+    if (!locked[b] && b !== n - 1) continue;
+    const part = douglasPeucker(pts.slice(a * 2, b * 2 + 2), tol);
+    for (let i = 2; i < part.length; i += 2) {
+      outPts.push(part[i], part[i + 1]);
+      outLocked.push(i === part.length - 2 ? locked[b] : false);
+    }
+    a = b;
+  }
+  return { pts: outPts, locked: outLocked };
+}
+
+function simplifyClosed(pts: number[], locked: boolean[], tol: number): { pts: number[]; locked: boolean[] } {
+  const n = locked.length;
+  const first = locked.indexOf(true);
+  if (first >= 0) {
+    // Rotate so the ring starts at a locked point, close it, simplify, reopen.
+    const rp: number[] = [];
+    const rl: boolean[] = [];
+    for (let k = 0; k <= n; k++) {
+      const i = (first + k) % n;
+      rp.push(pts[i * 2], pts[i * 2 + 1]);
+      rl.push(locked[i]);
+    }
+    const r = simplifyLocked(rp, rl, tol);
+    return { pts: r.pts.slice(0, -2), locked: r.locked.slice(0, -1) };
+  }
+  return { pts: simplifyRing(pts, tol), locked: [] };
+}
+
+function simplifyRing(pts: number[], tol: number): number[] {
   // Treat as an open path that starts and ends at pts[0].
   const ring = pts.concat(pts[0], pts[1]);
   let s = douglasPeucker(ring, tol);
@@ -250,8 +298,17 @@ function simplifyClosed(pts: number[], tol: number): number[] {
  * Turn a point chain into cubic segments. Open chains keep their end points
  * fixed (they are shared junctions) and use one-sided tangents there.
  */
-function buildSegments(pts: number[], closed: boolean, tol: number, curves: boolean, cornerCos: number): Float64Array {
-  const p = closed ? simplifyClosed(pts, tol) : douglasPeucker(pts, tol);
+function buildSegments(
+  pts: number[],
+  locked: boolean[],
+  closed: boolean,
+  tol: number,
+  curves: boolean,
+  cornerCos: number,
+): Float64Array {
+  const simplified = closed ? simplifyClosed(pts, locked, tol) : simplifyLocked(pts, locked, tol);
+  const p = simplified.pts;
+  const isLocked = simplified.locked;
   const n = p.length / 2;
   const segCount = closed ? n : n - 1;
   const out = new Float64Array(2 + segCount * 6);
@@ -262,7 +319,7 @@ function buildSegments(pts: number[], closed: boolean, tol: number, curves: bool
   // Unit tangent at vertex i (or null for a corner).
   const tangents: ([number, number] | null)[] = [];
   for (let i = 0; i < n; i++) {
-    if (!curves || (!closed && (i === 0 || i === n - 1))) {
+    if (!curves || isLocked[i] || (!closed && (i === 0 || i === n - 1))) {
       tangents.push(null);
       continue;
     }

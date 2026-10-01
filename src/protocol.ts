@@ -37,6 +37,8 @@ export interface VectorParams {
 }
 
 export interface PipelineParams {
+  /** Image the request was made for; results for older images are discarded. */
+  imageVersion: number;
   quantize: QuantizeParams;
   palette: PaletteParams;
   cleanup: CleanupParams;
@@ -59,6 +61,7 @@ export interface QuantizeInfo {
 }
 
 export interface PipelineResult {
+  imageVersion: number;
   width: number;
   height: number;
   quant: QuantizeInfo;
@@ -68,20 +71,23 @@ export interface PipelineResult {
   labels: Uint8Array;
   /** Pixel count per palette entry in the final label map. */
   counts: number[];
-  /** Features still thinner than the minimum feature size after cleanup. */
+  /** Identifies the cleaned label map (thin-feature results refer to it). */
+  cleanKey: string;
+  /** Features thinner than the minimum feature size; -1 while still being computed. */
   thinCount: number;
-  /** 1 for pixels belonging to a thin feature. */
+  /** 1 for pixels belonging to a thin feature (empty while pending). */
   thinMask: Uint8Array;
   vector: VectorResult | null;
 }
 
 export type WorkerRequest =
-  | { type: 'image'; width: number; height: number; data: Uint8ClampedArray }
+  | { type: 'image'; version: number; width: number; height: number; data: Uint8ClampedArray }
   | { type: 'process'; id: number; params: PipelineParams }
   | { type: 'png'; id: number; width: number; height: number; colors: (RGB | null)[] };
 
 export type WorkerResponse =
   | { type: 'progress'; id: number; stage: string }
   | { type: 'result'; id: number; result: PipelineResult }
+  | { type: 'thin'; cleanKey: string; count: number; mask: Uint8Array }
   | { type: 'error'; id: number; message: string }
   | { type: 'png'; id: number; blob: Blob | null; rgba: Uint8ClampedArray | null; width: number; height: number };
