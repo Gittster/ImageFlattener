@@ -1,4 +1,5 @@
 import type { RGB } from './core/color';
+import type { ExportMode } from './core/svg';
 
 export interface QuantizeParams {
   colors: number;
@@ -22,10 +23,33 @@ export interface CleanupParams {
   minFeaturePx: number;
 }
 
+export interface VectorParams {
+  /** Simplification tolerance in pixels. */
+  tolerance: number;
+  curves: boolean;
+  mode: ExportMode;
+  /** Palette entry indices, bottom of the stack first. */
+  stack: number[];
+  /** Cutout bleed in pixels. */
+  bleedPx: number;
+  /** Output units per pixel (mm per working-image pixel). */
+  scale: number;
+}
+
 export interface PipelineParams {
   quantize: QuantizeParams;
   palette: PaletteParams;
   cleanup: CleanupParams;
+  /** Omitted when no vector output is needed. */
+  vector?: VectorParams;
+}
+
+export interface VectorResult {
+  /** Stack actually used (palette entry indices, bottom first). */
+  stack: number[];
+  /** SVG path data per stack position, in output units. */
+  paths: string[];
+  mode: ExportMode;
 }
 
 export interface QuantizeInfo {
@@ -48,13 +72,16 @@ export interface PipelineResult {
   thinCount: number;
   /** 1 for pixels belonging to a thin feature. */
   thinMask: Uint8Array;
+  vector: VectorResult | null;
 }
 
 export type WorkerRequest =
   | { type: 'image'; width: number; height: number; data: Uint8ClampedArray }
-  | { type: 'process'; id: number; params: PipelineParams };
+  | { type: 'process'; id: number; params: PipelineParams }
+  | { type: 'png'; id: number; width: number; height: number; colors: (RGB | null)[] };
 
 export type WorkerResponse =
   | { type: 'progress'; id: number; stage: string }
   | { type: 'result'; id: number; result: PipelineResult }
-  | { type: 'error'; id: number; message: string };
+  | { type: 'error'; id: number; message: string }
+  | { type: 'png'; id: number; blob: Blob | null; rgba: Uint8ClampedArray | null; width: number; height: number };

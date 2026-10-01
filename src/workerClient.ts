@@ -1,3 +1,4 @@
+import type { RGB } from './core/color';
 import type { PipelineParams, PipelineResult, WorkerRequest, WorkerResponse } from './protocol';
 
 /**
@@ -9,6 +10,7 @@ export class WorkerClient {
   private nextId = 1;
   private busyId = 0;
   private pending: PipelineParams | null = null;
+  private readonly pngRequests = new Map<number, { resolve: (b: Blob) => void; reject: (e: Error) => void }>();
 
   onResult: (r: PipelineResult) => void = () => {};
   onProgress: (stage: string | null) => void = () => {};
@@ -37,6 +39,16 @@ export class WorkerClient {
     this.send(params);
   }
 
+  /** Render the flattened PNG at the given size (off the main thread when possible). */
+  renderPng(width: number, height: number, colors: (RGB | null)[]): Promise<Blob> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pngRequests.set(id, { resolve, reject });
+      const msg: WorkerRequest = { type: 'png', id, width, height, colors };
+      this.worker.postMessage(msg);
+    });
+  }
+
   private send(params: PipelineParams): void {
     const id = this.nextId++;
     this.busyId = id;
@@ -46,6 +58,15 @@ export class WorkerClient {
   }
 
   private handle(msg: WorkerResponse): void {
+    const png = this.pngRequests.get(msg.id);
+    if (png) {
+      this.pngRequests.delete(msg.id);
+      if (msg.type === 'png') {
+        if (msg.blob) png.resolve(msg.blob);
+        else encodePngOnMainThread(msg.rgba!, msg.width, msg.height).then(png.resolve, png.reject);
+      } else if (msg.type === 'error') png.reject(new Error(msg.message));
+      return;
+    }
     if (msg.type === 'progress') {
       if (!this.pending) this.onProgress(msg.stage);
       return;
@@ -59,6 +80,16 @@ export class WorkerClient {
     }
     this.onProgress(null);
     if (msg.type === 'result') this.onResult(msg.result);
-    else this.onError(msg.message);
+    else if (msg.type === 'error') this.onError(msg.message);
   }
+}
+
+function encodePngOnMainThread(rgba: Uint8ClampedArray, w: number, h: number): Promise<Blob> {
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext('2d')!.putImageData(new ImageData(rgba as Uint8ClampedArray<ArrayBuffer>, w, h), 0, 0);
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('PNG encoding failed'))), 'image/png'),
+  );
 }

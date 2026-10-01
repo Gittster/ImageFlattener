@@ -1,5 +1,9 @@
 import './style.css';
-import { hexToRgb, type RGB } from './core/color';
+import { hexToRgb, rgbToHex, type RGB } from './core/color';
+import type { ExportMode, SvgLayer } from './core/svg';
+import { layerId, svgDocument } from './core/svg';
+import { baseName, downloadBlob, svgBlob, zipBlob } from './exporters';
+import { EXPORT_MAX } from './imageLoader';
 import { clusterGroups, entriesFromClusters, mergeEntries, resolveColors, type PaletteEntry } from './core/palette';
 import { VOID } from './core/types';
 import { loadImage, type LoadedImage } from './imageLoader';
@@ -82,6 +86,44 @@ app.innerHTML = `
       </div>
     </section>
     <section>
+      <h2>Vector</h2>
+      <div class="field">
+        <label for="tolerance">Simplification tolerance <output id="tolerance-out"></output></label>
+        <input id="tolerance" type="range" min="0.25" max="4" step="0.25" value="1" />
+      </div>
+      <label class="check"><input id="curves" type="checkbox" checked /> Smooth curves (Bézier)</label>
+    </section>
+    <section>
+      <h2>Export</h2>
+      <div class="field">
+        <div class="label"><span>Mode</span></div>
+        <div class="seg" id="mode-seg">
+          <button data-mode="stacked" class="on" title="Each layer continues under the layers above it">Stacked</button>
+          <button data-mode="cutout" title="Non-overlapping shapes that tile the image">Cutout</button>
+        </div>
+      </div>
+      <div class="field" id="bleed-field" hidden>
+        <label for="bleed">Bleed / overlap <output id="bleed-out"></output></label>
+        <input id="bleed" type="range" min="0" max="0.2" step="0.01" value="0" />
+      </div>
+      <div class="field">
+        <div class="label"><span>Stack order</span><span class="value">top ↑</span></div>
+        <ol id="stack" class="stack"></ol>
+        <div class="hint">Drag to reorder (or use the arrows). Bottom of the list = bottom of the print.</div>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <label class="check" style="margin:0"><input id="bg" type="checkbox" /> Background rect</label>
+        <input id="bg-color" type="color" value="#ffffff" aria-label="Background color" disabled />
+      </div>
+      <div class="export-buttons">
+        <button id="export-svg" class="primary" disabled>Layered SVG</button>
+        <button id="export-zip" disabled>Per-color SVGs (.zip)</button>
+        <button id="export-png" disabled>Flattened PNG</button>
+        <button id="export-json" disabled>Settings (.json)</button>
+      </div>
+      <div id="export-info" class="hint"></div>
+    </section>
+    <section>
       <div id="status" class="status"></div>
     </section>
   </aside>
@@ -96,6 +138,10 @@ app.innerHTML = `
     <div class="pane">
       <div class="pane-head">
         <span class="title">Preview</span>
+        <div class="seg" id="view-seg">
+          <button data-view="raster" class="on">Raster</button>
+          <button data-view="vector">Vector</button>
+        </div>
         <span class="spacer"></span>
         <button id="zoom-out" title="Zoom out">−</button>
         <button id="zoom-fit" title="Fit to view">Fit</button>
@@ -104,6 +150,7 @@ app.innerHTML = `
       <div class="view" id="view-preview">
         <div class="content" id="content-preview">
           <canvas id="raster-canvas"></canvas>
+          <img id="vector-img" alt="Vector preview" draggable="false" hidden />
           <canvas id="thin-canvas" hidden></canvas>
         </div>
         <div class="busy" id="busy"><span class="spinner"></span><span id="busy-text">Working…</span></div>
@@ -136,6 +183,15 @@ interface State {
   nozzleMm: number;
   featureMult: number;
   showThin: boolean;
+  tolerance: number;
+  curves: boolean;
+  mode: ExportMode;
+  bleedMm: number;
+  /** Palette entry ids, bottom of the stack first. */
+  stackIds: number[];
+  background: boolean;
+  backgroundColor: string;
+  view: 'raster' | 'vector';
 }
 
 const state: State = {
@@ -156,6 +212,14 @@ const state: State = {
   nozzleMm: 0.4,
   featureMult: 1.5,
   showThin: false,
+  tolerance: 1,
+  curves: true,
+  mode: 'stacked',
+  bleedMm: 0,
+  stackIds: [],
+  background: false,
+  backgroundColor: '#FFFFFF',
+  view: 'raster',
 };
 
 interface Derived {
@@ -199,6 +263,7 @@ client.onResult = (result) => {
     state.quantKey = result.quant.key;
     state.entries = entriesFromClusters(result.quant.centroids);
     state.selected.clear();
+    syncStack();
   }
   renderResult();
 };
@@ -215,6 +280,14 @@ function buildParams(): PipelineParams {
     cleanup: { modeFilter: state.modeFilter, despeckleArea: d.despeckleArea, minFeaturePx: d.minFeaturePx },
     quantize: { colors: state.colors, blur: state.blur, seed: state.seed },
     palette: { quantKey: state.quantKey, groups: clusterGroups(state.entries, state.result?.quant.centroids.length ?? 0) },
+    vector: {
+      tolerance: state.tolerance,
+      curves: state.curves,
+      mode: state.mode,
+      stack: stackIndices(),
+      bleedPx: state.bleedMm * d.pxPerMm,
+      scale: 1 / d.pxPerMm,
+    },
   };
 }
 
@@ -252,6 +325,214 @@ function renderResult(): void {
   renderRaster(r);
   renderThin(r);
   renderPalette();
+  renderStack();
+  renderVector();
+  updateExportButtons();
+}
+
+// ---------------------------------------------------------- stack order ---
+/** Keep stackIds consistent with the current palette entries. */
+function syncStack(): void {
+  const ids = new Set(state.entries.map((e) => e.id));
+  const kept = state.stackIds.filter((id) => ids.has(id));
+  for (const e of state.entries) if (!kept.includes(e.id)) kept.push(e.id);
+  state.stackIds = kept;
+}
+
+/** Stack as palette entry indices, bottom first. */
+function stackIndices(): number[] {
+  return state.stackIds.map((id) => state.entries.findIndex((e) => e.id === id)).filter((i) => i >= 0);
+}
+
+function moveStack(from: number, to: number): void {
+  if (from === to || to < 0 || to >= state.stackIds.length) return;
+  const [id] = state.stackIds.splice(from, 1);
+  state.stackIds.splice(to, 0, id);
+  renderStack();
+  schedule(0);
+}
+
+function renderStack(): void {
+  const list = $('stack');
+  const hex = paletteHex();
+  list.innerHTML = '';
+  const n = state.stackIds.length;
+  // Display top of the stack first.
+  for (let pos = n - 1; pos >= 0; pos--) {
+    const idx = state.entries.findIndex((e) => e.id === state.stackIds[pos]);
+    if (idx < 0) continue;
+    const li = document.createElement('li');
+    li.draggable = true;
+    li.dataset.pos = String(pos);
+    li.innerHTML = `<span class="grip" aria-hidden="true">⋮⋮</span>
+      <span class="chip" style="background:${hex[idx]}"></span>
+      <span class="hex">${pos + 1}. ${hex[idx]}</span>
+      <span class="spacer"></span>
+      <button class="mini" title="Move up" ${pos === n - 1 ? 'disabled' : ''}>↑</button>
+      <button class="mini" title="Move down" ${pos === 0 ? 'disabled' : ''}>↓</button>`;
+    const [up, down] = li.querySelectorAll('button');
+    up.addEventListener('click', () => moveStack(pos, pos + 1));
+    down.addEventListener('click', () => moveStack(pos, pos - 1));
+    li.addEventListener('dragstart', (e) => {
+      e.dataTransfer?.setData('text/plain', String(pos));
+      li.classList.add('dragging');
+    });
+    li.addEventListener('dragend', () => li.classList.remove('dragging'));
+    li.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      li.classList.add('over');
+    });
+    li.addEventListener('dragleave', () => li.classList.remove('over'));
+    li.addEventListener('drop', (e) => {
+      e.preventDefault();
+      li.classList.remove('over');
+      const from = Number(e.dataTransfer?.getData('text/plain'));
+      if (Number.isInteger(from)) moveStack(from, pos);
+    });
+    list.appendChild(li);
+  }
+}
+
+// --------------------------------------------------------------- vector ---
+function svgLayers(): SvgLayer[] | null {
+  const v = state.result?.vector;
+  if (!v || !resultInSync() || v.stack.length !== state.entries.length) return null;
+  const hex = paletteHex();
+  return v.stack.map((entry, i) => ({ index: i + 1, color: hex[entry], d: v.paths[i] }));
+}
+
+function currentSvg(layers = svgLayers()): string | null {
+  if (!layers || !state.image) return null;
+  const d = derived();
+  return svgDocument({
+    widthMm: state.printWidthMm,
+    heightMm: d.heightMm,
+    layers,
+    background: state.background ? state.backgroundColor : null,
+    title: `${state.image.name} (${state.mode})`,
+  });
+}
+
+let vectorUrl: string | null = null;
+function renderVector(): void {
+  const img = $<HTMLImageElement>('vector-img');
+  const svg = state.view === 'vector' ? currentSvg() : null;
+  if (vectorUrl) URL.revokeObjectURL(vectorUrl);
+  vectorUrl = svg ? URL.createObjectURL(svgBlob(svg)) : null;
+  if (vectorUrl) img.src = vectorUrl;
+  img.hidden = state.view !== 'vector' || !vectorUrl;
+  $('raster-canvas').hidden = state.view !== 'raster';
+  $('thin-canvas').hidden = state.view !== 'raster' || !state.showThin;
+}
+
+// --------------------------------------------------------------- export ---
+function updateExportButtons(): void {
+  const ok = !!svgLayers();
+  for (const id of ['export-svg', 'export-zip', 'export-png', 'export-json']) $<HTMLButtonElement>(id).disabled = !ok;
+  const d = derived();
+  const size = exportPngSize();
+  $('export-info').textContent = state.image
+    ? `SVG: ${state.printWidthMm} × ${d.heightMm.toFixed(1)} mm · PNG: ${size.width} × ${size.height} px`
+    : '';
+}
+
+function exportPngSize(): { width: number; height: number } {
+  const img = state.image;
+  if (!img) return { width: 0, height: 0 };
+  const s = Math.min(1, EXPORT_MAX / Math.max(img.originalWidth, img.originalHeight));
+  return { width: Math.max(1, Math.round(img.originalWidth * s)), height: Math.max(1, Math.round(img.originalHeight * s)) };
+}
+
+function exportName(suffix: string): string {
+  return `${baseName(state.image?.name ?? 'image')}-${suffix}`;
+}
+
+$('export-svg').addEventListener('click', () => {
+  const svg = currentSvg();
+  if (svg) downloadBlob(svgBlob(svg), exportName(`${state.entries.length}c-${state.mode}.svg`));
+});
+
+$('export-zip').addEventListener('click', () => {
+  const layers = svgLayers();
+  if (!layers || !state.image) return;
+  const d = derived();
+  const files = layers.map((layer) => ({
+    name: `${String(layer.index).padStart(2, '0')}-${layerId(layer).replace('#', '')}.svg`,
+    content: svgDocument({ widthMm: state.printWidthMm, heightMm: d.heightMm, layers: [layer], title: layerId(layer) }),
+  }));
+  files.push({ name: 'settings.json', content: settingsJson() });
+  downloadBlob(zipBlob(files), exportName(`${state.entries.length}c-${state.mode}-layers.zip`));
+});
+
+$('export-png').addEventListener('click', async () => {
+  const r = state.result;
+  if (!r) return;
+  const btn = $<HTMLButtonElement>('export-png');
+  btn.disabled = true;
+  try {
+    const { width, height } = exportPngSize();
+    const colors: (RGB | null)[] = paletteColors();
+    const blob = await client.renderPng(width, height, colors);
+    downloadBlob(blob, exportName(`${state.entries.length}c.png`));
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('export-json').addEventListener('click', () => {
+  downloadBlob(new Blob([settingsJson()], { type: 'application/json' }), exportName('settings.json'));
+});
+
+function settingsJson(): string {
+  const r = state.result;
+  const hex = paletteHex();
+  const total = r ? r.counts.reduce((a, b) => a + b, 0) : 0;
+  const stack = stackIndices();
+  const d = derived();
+  const doc = {
+    generator: 'Image Flattener',
+    version: 1,
+    image: state.image && {
+      name: state.image.name,
+      originalWidth: state.image.originalWidth,
+      originalHeight: state.image.originalHeight,
+      workingWidth: state.image.working.width,
+      workingHeight: state.image.working.height,
+    },
+    palette: state.entries.map((e, i) => ({
+      index: i,
+      color: hex[i],
+      clusterColor: rgbToHex(e.base),
+      overridden: e.override !== null,
+      coveragePercent: total > 0 && r ? Math.round((10000 * r.counts[i]) / total) / 100 : 0,
+      stackPosition: stack.indexOf(i) + 1,
+      svgGroupId: `color-${stack.indexOf(i) + 1}-${hex[i]}`,
+    })),
+    stackOrder: stack.map((i) => hex[i]),
+    settings: {
+      colors: state.colors,
+      blurPx: state.blur,
+      seed: state.seed,
+      forceBlackWhite: state.forceBW,
+      modeFilterPasses: state.modeFilter,
+      despeckle: state.despeckle,
+      despeckleMm: d.despeckleMm,
+      printWidthMm: state.printWidthMm,
+      printHeightMm: Math.round(d.heightMm * 1000) / 1000,
+      nozzleMm: state.nozzleMm,
+      minFeatureMultiplier: state.featureMult,
+      minFeatureMm: Math.round(d.minFeatureMm * 1000) / 1000,
+      simplifyTolerancePx: state.tolerance,
+      curves: state.curves,
+      exportMode: state.mode,
+      bleedMm: state.mode === 'cutout' ? state.bleedMm : 0,
+      background: state.background ? state.backgroundColor : null,
+    },
+    thinFeatureWarnings: r?.thinCount ?? 0,
+  };
+  return JSON.stringify(doc, null, 2) + '\n';
 }
 
 function renderThin(r: PipelineResult): void {
@@ -349,6 +630,7 @@ function renderPalette(): void {
       e.override = (picker as HTMLInputElement).value.toUpperCase();
       (swatch as HTMLElement).style.background = e.override;
       if (state.result) renderRaster(state.result);
+      renderStack();
     });
     picker.addEventListener('change', () => renderResult());
     revert.addEventListener('click', () => {
@@ -395,6 +677,7 @@ $('merge-btn').addEventListener('click', () => {
   if (!q || state.selected.size < 2) return;
   state.entries = mergeEntries(state.entries, [...state.selected], q.centroids, q.counts);
   state.selected.clear();
+  syncStack();
   renderPalette();
   schedule(0);
 });
@@ -403,6 +686,8 @@ $('reset-palette-btn').addEventListener('click', () => {
   if (!q) return;
   state.entries = entriesFromClusters(q.centroids);
   state.selected.clear();
+  state.stackIds = [];
+  syncStack();
   renderPalette();
   schedule(0);
 });
@@ -445,6 +730,32 @@ bindCheck('despeckle-auto', (v) => {
   if (!v) state.despeckleMm = Number($<HTMLInputElement>('despeckle-mm').value) || state.despeckleMm;
 });
 bindCheck('show-thin', (v) => (state.showThin = v), false);
+bindRange('tolerance', (v) => `${v} px`, (v) => (state.tolerance = v));
+bindCheck('curves', (v) => (state.curves = v));
+bindRange('bleed', (v) => (v === 0 ? 'off' : `${v.toFixed(2)} mm`), (v) => (state.bleedMm = v));
+for (const b of $('mode-seg').querySelectorAll<HTMLButtonElement>('button')) {
+  b.addEventListener('click', () => {
+    state.mode = b.dataset.mode as ExportMode;
+    $('mode-seg').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+    $('bleed-field').hidden = state.mode !== 'cutout';
+    schedule(0);
+  });
+}
+for (const b of $('view-seg').querySelectorAll<HTMLButtonElement>('button')) {
+  b.addEventListener('click', () => {
+    state.view = b.dataset.view as 'raster' | 'vector';
+    $('view-seg').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+    renderVector();
+  });
+}
+bindCheck('bg', (v) => {
+  state.background = v;
+  $<HTMLInputElement>('bg-color').disabled = !v;
+}, false);
+$<HTMLInputElement>('bg-color').addEventListener('input', (e) => {
+  state.backgroundColor = (e.target as HTMLInputElement).value.toUpperCase();
+  renderVector();
+});
 renderDerived();
 
 $('seed-out').textContent = String(state.seed);
