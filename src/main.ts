@@ -384,6 +384,14 @@ function renderStack(): void {
   const hex = paletteHex();
   list.innerHTML = '';
   const n = state.stackIds.length;
+  const counts = resultInSync() ? state.result!.counts : null;
+  // Exported layer number for each stack position (removed colors are skipped).
+  const layerNo: number[] = [];
+  let next = 1;
+  for (let pos = 0; pos < n; pos++) {
+    const idx = state.entries.findIndex((e) => e.id === state.stackIds[pos]);
+    layerNo.push(counts && idx >= 0 && counts[idx] === 0 ? 0 : next++);
+  }
   // Display top of the stack first.
   for (let pos = n - 1; pos >= 0; pos--) {
     const idx = state.entries.findIndex((e) => e.id === state.stackIds[pos]);
@@ -393,7 +401,7 @@ function renderStack(): void {
     li.dataset.pos = String(pos);
     li.innerHTML = `<span class="grip" aria-hidden="true">⋮⋮</span>
       <span class="chip" style="background:${hex[idx]}"></span>
-      <span class="hex">${pos + 1}. ${hex[idx]}</span>
+      <span class="hex">${layerNo[pos] ? `${layerNo[pos]}. ` : ''}${hex[idx]}${layerNo[pos] ? '' : ' <span class="tag">removed by cleanup</span>'}</span>
       <span class="spacer"></span>
       <button class="mini" title="Move up" ${pos === n - 1 ? 'disabled' : ''}>↑</button>
       <button class="mini" title="Move down" ${pos === 0 ? 'disabled' : ''}>↓</button>`;
@@ -425,7 +433,18 @@ function svgLayers(): SvgLayer[] | null {
   const v = state.result?.vector;
   if (!v || !resultInSync() || v.stack.length !== state.entries.length) return null;
   const hex = paletteHex();
-  return v.stack.map((entry, i) => ({ index: i + 1, color: hex[entry], d: v.paths[i] }));
+  const counts = state.result!.counts;
+  // Colors that cleanup removed entirely get no (empty) layer.
+  return v.stack
+    .map((entry, i) => ({ entry, d: v.paths[i] }))
+    .filter(({ entry }) => counts[entry] > 0)
+    .map(({ entry, d }, i) => ({ index: i + 1, color: hex[entry], d }));
+}
+
+/** Stack (entry indices, bottom first) without colors removed by cleanup. */
+function exportedStack(): number[] {
+  const counts = state.result?.counts ?? [];
+  return stackIndices().filter((i) => (counts[i] ?? 0) > 0);
 }
 
 function currentSvg(layers = svgLayers()): string | null {
@@ -476,7 +495,7 @@ function exportName(suffix: string): string {
 
 $('export-svg').addEventListener('click', () => {
   const svg = currentSvg();
-  if (svg) downloadBlob(svgBlob(svg), exportName(`${state.entries.length}c-${state.mode}.svg`));
+  if (svg) downloadBlob(svgBlob(svg), exportName(`${exportedStack().length}c-${state.mode}.svg`));
 });
 
 $('export-zip').addEventListener('click', () => {
@@ -488,7 +507,7 @@ $('export-zip').addEventListener('click', () => {
     content: svgDocument({ widthMm: state.printWidthMm, heightMm: d.heightMm, layers: [layer], title: layerId(layer) }),
   }));
   files.push({ name: 'settings.json', content: settingsJson() });
-  downloadBlob(zipBlob(files), exportName(`${state.entries.length}c-${state.mode}-layers.zip`));
+  downloadBlob(zipBlob(files), exportName(`${exportedStack().length}c-${state.mode}-layers.zip`));
 });
 
 $('export-png').addEventListener('click', async () => {
@@ -500,7 +519,7 @@ $('export-png').addEventListener('click', async () => {
     const { width, height } = exportPngSize();
     const colors: (RGB | null)[] = paletteColors();
     const blob = await client.renderPng(width, height, colors);
-    downloadBlob(blob, exportName(`${state.entries.length}c.png`));
+    downloadBlob(blob, exportName(`${exportedStack().length}c.png`));
   } catch (err) {
     setStatus(err instanceof Error ? err.message : String(err), 'error');
   } finally {
@@ -516,7 +535,7 @@ function settingsJson(): string {
   const r = state.result;
   const hex = paletteHex();
   const total = r ? r.counts.reduce((a, b) => a + b, 0) : 0;
-  const stack = stackIndices();
+  const stack = exportedStack();
   const d = derived();
   const doc = {
     generator: 'Image Flattener',
@@ -534,8 +553,9 @@ function settingsJson(): string {
       clusterColor: rgbToHex(e.base),
       overridden: e.override !== null,
       coveragePercent: total > 0 && r ? Math.round((10000 * r.counts[i]) / total) / 100 : 0,
-      stackPosition: stack.indexOf(i) + 1,
-      svgGroupId: `color-${stack.indexOf(i) + 1}-${hex[i]}`,
+      // null when cleanup removed every pixel of this color (not exported).
+      stackPosition: stack.includes(i) ? stack.indexOf(i) + 1 : null,
+      svgGroupId: stack.includes(i) ? `color-${stack.indexOf(i) + 1}-${hex[i]}` : null,
     })),
     stackOrder: stack.map((i) => hex[i]),
     settings: {
@@ -655,7 +675,9 @@ function renderPalette(): void {
       <button class="swatch" title="Click to override the output color" style="background:${hex[i]}"></button>
       <input type="color" value="${hex[i].toLowerCase()}" hidden />
       <span class="hex">${hex[i]}${overridden ? ' <span class="tag">edited</span>' : ''}</span>
-      <span class="pct">${pct < 0.1 && pct > 0 ? '<0.1' : pct.toFixed(1)}%</span>
+      <span class="pct" ${r && r.counts[i] === 0 ? 'title="Removed entirely by cleanup; not exported"' : ''}>${
+        r && r.counts[i] === 0 ? 'removed' : pct < 0.1 ? '<0.1%' : `${pct.toFixed(1)}%`
+      }</span>
       <button class="mini" title="Revert to cluster color" ${overridden ? '' : 'hidden'}>↺</button>`;
     const [check, swatch, picker, , , revert] = [...row.children] as HTMLElement[];
     check.addEventListener('change', () => {
