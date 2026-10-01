@@ -50,6 +50,38 @@ app.innerHTML = `
       <div class="hint">Click a swatch to override its output color. Overrides don't change which pixels belong to it.</div>
     </section>
     <section>
+      <h2>Cleanup</h2>
+      <div class="field">
+        <label for="mode">Smooth edges (mode filter) <output id="mode-out"></output></label>
+        <input id="mode" type="range" min="0" max="3" step="1" value="1" />
+      </div>
+      <label class="check"><input id="despeckle" type="checkbox" checked /> Despeckle</label>
+      <div class="field">
+        <div class="label"><span>Remove regions smaller than</span><span class="value" id="despeckle-info"></span></div>
+        <div class="row">
+          <input id="despeckle-mm" type="number" min="0" max="50" step="0.05" value="0.6" aria-label="Despeckle size in mm" /> mm
+          <label class="check" style="margin:0"><input id="despeckle-auto" type="checkbox" checked /> = min feature</label>
+        </div>
+      </div>
+      <div id="thin-warning" class="status"></div>
+      <label class="check"><input id="show-thin" type="checkbox" /> Highlight thin features</label>
+    </section>
+    <section>
+      <h2>Print size</h2>
+      <div class="field">
+        <div class="label"><span>Print width</span><span class="value" id="print-height"></span></div>
+        <div class="row"><input id="print-width" type="number" min="1" max="2000" step="1" value="100" aria-label="Print width in mm" /> mm</div>
+      </div>
+      <div class="field">
+        <div class="label"><span>Nozzle diameter</span></div>
+        <div class="row"><input id="nozzle" type="number" min="0.05" max="2" step="0.05" value="0.4" aria-label="Nozzle diameter in mm" /> mm</div>
+      </div>
+      <div class="field">
+        <div class="label"><span>Min feature size</span><span class="value" id="min-feature-info"></span></div>
+        <div class="row"><input id="feature-mult" type="number" min="0.5" max="5" step="0.1" value="1.5" aria-label="Minimum feature size multiplier" /> × nozzle</div>
+      </div>
+    </section>
+    <section>
       <div id="status" class="status"></div>
     </section>
   </aside>
@@ -72,6 +104,7 @@ app.innerHTML = `
       <div class="view" id="view-preview">
         <div class="content" id="content-preview">
           <canvas id="raster-canvas"></canvas>
+          <canvas id="thin-canvas" hidden></canvas>
         </div>
         <div class="busy" id="busy"><span class="spinner"></span><span id="busy-text">Working…</span></div>
       </div>
@@ -95,6 +128,14 @@ interface State {
   entries: PaletteEntry[];
   selected: Set<number>;
   forceBW: boolean;
+  modeFilter: number;
+  despeckle: boolean;
+  despeckleAuto: boolean;
+  despeckleMm: number;
+  printWidthMm: number;
+  nozzleMm: number;
+  featureMult: number;
+  showThin: boolean;
 }
 
 const state: State = {
@@ -107,7 +148,42 @@ const state: State = {
   entries: [],
   selected: new Set(),
   forceBW: false,
+  modeFilter: 1,
+  despeckle: true,
+  despeckleAuto: true,
+  despeckleMm: 0.6,
+  printWidthMm: 100,
+  nozzleMm: 0.4,
+  featureMult: 1.5,
+  showThin: false,
 };
+
+interface Derived {
+  pxPerMm: number;
+  heightMm: number;
+  minFeatureMm: number;
+  minFeaturePx: number;
+  despeckleMm: number;
+  despeckleArea: number;
+}
+
+/** Print-size dependent values, in working-image pixels. */
+function derived(): Derived {
+  const w = state.image?.working.width ?? 1;
+  const h = state.image?.working.height ?? 1;
+  const pxPerMm = w / state.printWidthMm;
+  const minFeatureMm = state.nozzleMm * state.featureMult;
+  const despeckleMm = state.despeckleAuto ? minFeatureMm : state.despeckleMm;
+  const side = despeckleMm * pxPerMm;
+  return {
+    pxPerMm,
+    heightMm: (state.printWidthMm * h) / w,
+    minFeatureMm,
+    minFeaturePx: minFeatureMm * pxPerMm,
+    despeckleMm,
+    despeckleArea: state.despeckle ? side * side : 0,
+  };
+}
 
 // ------------------------------------------------------------- worker -----
 const client = new WorkerClient();
@@ -134,7 +210,9 @@ function schedule(delay = 200): void {
 }
 
 function buildParams(): PipelineParams {
+  const d = derived();
   return {
+    cleanup: { modeFilter: state.modeFilter, despeckleArea: d.despeckleArea, minFeaturePx: d.minFeaturePx },
     quantize: { colors: state.colors, blur: state.blur, seed: state.seed },
     palette: { quantKey: state.quantKey, groups: clusterGroups(state.entries, state.result?.quant.centroids.length ?? 0) },
   };
@@ -172,7 +250,45 @@ function renderResult(): void {
   const r = state.result;
   if (!r || !resultInSync()) return;
   renderRaster(r);
+  renderThin(r);
   renderPalette();
+}
+
+function renderThin(r: PipelineResult): void {
+  const el = $('thin-warning');
+  const d = derived();
+  if (r.thinCount > 0) {
+    el.textContent = `⚠ ${r.thinCount} feature${r.thinCount === 1 ? ' is' : 's are'} thinner than ${d.minFeatureMm.toFixed(2)} mm.`;
+    el.className = 'status warn';
+  } else {
+    el.textContent = r.entryCount > 0 ? `✓ No features thinner than ${d.minFeatureMm.toFixed(2)} mm.` : '';
+    el.className = 'status';
+  }
+  const c = $<HTMLCanvasElement>('thin-canvas');
+  c.hidden = !state.showThin;
+  if (!state.showThin) return;
+  c.width = r.width;
+  c.height = r.height;
+  const g = c.getContext('2d')!;
+  const img = g.createImageData(r.width, r.height);
+  for (let i = 0; i < r.thinMask.length; i++) {
+    if (!r.thinMask[i]) continue;
+    img.data[i * 4] = 255;
+    img.data[i * 4 + 1] = 0;
+    img.data[i * 4 + 2] = 200;
+    img.data[i * 4 + 3] = 230;
+  }
+  g.putImageData(img, 0, 0);
+}
+
+function renderDerived(): void {
+  const d = derived();
+  $('print-height').textContent = state.image ? `height ${d.heightMm.toFixed(1)} mm` : '';
+  $('min-feature-info').textContent = `${d.minFeatureMm.toFixed(2)} mm` + (state.image ? ` ≈ ${d.minFeaturePx.toFixed(1)} px` : '');
+  const mmInput = $<HTMLInputElement>('despeckle-mm');
+  mmInput.disabled = state.despeckleAuto || !state.despeckle;
+  if (state.despeckleAuto) mmInput.value = d.minFeatureMm.toFixed(2);
+  $('despeckle-info').textContent = state.despeckle && state.image ? `≈ ${Math.round(d.despeckleArea)} px²` : '';
 }
 
 function renderRaster(r: PipelineResult): void {
@@ -295,6 +411,42 @@ $<HTMLInputElement>('force-bw').addEventListener('change', (e) => {
   renderResult();
 });
 
+bindRange('mode', (v) => (v === 0 ? 'off' : `${v} pass${v > 1 ? 'es' : ''}`), (v) => (state.modeFilter = v));
+
+function bindNumber(id: string, min: number, max: number, apply: (v: number) => void): void {
+  const input = $<HTMLInputElement>(id);
+  input.addEventListener('input', () => {
+    const v = Number(input.value);
+    if (!Number.isFinite(v) || v < min || v > max) {
+      input.classList.add('invalid');
+      return;
+    }
+    input.classList.remove('invalid');
+    apply(v);
+    renderDerived();
+    schedule();
+  });
+}
+bindNumber('despeckle-mm', 0, 50, (v) => (state.despeckleMm = v));
+bindNumber('print-width', 1, 2000, (v) => (state.printWidthMm = v));
+bindNumber('nozzle', 0.05, 2, (v) => (state.nozzleMm = v));
+bindNumber('feature-mult', 0.5, 5, (v) => (state.featureMult = v));
+function bindCheck(id: string, apply: (v: boolean) => void, rerun = true): void {
+  $<HTMLInputElement>(id).addEventListener('change', (e) => {
+    apply((e.target as HTMLInputElement).checked);
+    renderDerived();
+    if (rerun) schedule(0);
+    else renderResult();
+  });
+}
+bindCheck('despeckle', (v) => (state.despeckle = v));
+bindCheck('despeckle-auto', (v) => {
+  state.despeckleAuto = v;
+  if (!v) state.despeckleMm = Number($<HTMLInputElement>('despeckle-mm').value) || state.despeckleMm;
+});
+bindCheck('show-thin', (v) => (state.showThin = v), false);
+renderDerived();
+
 $('seed-out').textContent = String(state.seed);
 $('reseed-btn').addEventListener('click', () => {
   state.seed = (Math.random() * 0xffffffff) >>> 0 || 1;
@@ -321,6 +473,7 @@ async function openBlob(blob: Blob, name: string): Promise<void> {
     c.height = h;
     c.getContext('2d')!.clearRect(0, 0, w, h);
     viewports.setContentSize(w, h);
+    renderDerived();
     viewports.fit();
     $('image-info').textContent =
       `${name} · ${img.originalWidth}×${img.originalHeight}` + (w !== img.originalWidth ? ` (working ${w}×${h})` : '');

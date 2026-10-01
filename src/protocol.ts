@@ -13,9 +13,19 @@ export interface PaletteParams {
   groups: number[];
 }
 
+export interface CleanupParams {
+  /** Number of 3x3 majority-filter passes (0 = off). */
+  modeFilter: number;
+  /** Regions smaller than this many pixels are merged into a neighbour (0 = off). */
+  despeckleArea: number;
+  /** Minimum printable feature width in pixels (for thin-feature warnings). */
+  minFeaturePx: number;
+}
+
 export interface PipelineParams {
   quantize: QuantizeParams;
   palette: PaletteParams;
+  cleanup: CleanupParams;
 }
 
 export interface QuantizeInfo {
@@ -34,6 +44,10 @@ export interface PipelineResult {
   labels: Uint8Array;
   /** Pixel count per palette entry in the final label map. */
   counts: number[];
+  /** Features still thinner than the minimum feature size after cleanup. */
+  thinCount: number;
+  /** 1 for pixels belonging to a thin feature. */
+  thinMask: Uint8Array;
 }
 
 export type WorkerRequest =

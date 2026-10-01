@@ -145,3 +145,4 @@ footer.foot {
 .swatch-row .pct { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
 .tag { font-family: system-ui, sans-serif; font-size: 10px; color: var(--accent); margin-left: 4px; }
 button.mini { padding: 0 4px; font-size: 12px; line-height: 20px; }
+input.invalid { border-color: var(--danger); }
