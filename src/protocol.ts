@@ -1,5 +1,6 @@
 import type { RGB } from './core/color';
 import type { ExportMode } from './core/svg';
+import type { Model3dOptions } from './core/model3d';
 
 export interface QuantizeParams {
   colors: number;
@@ -83,11 +84,13 @@ export interface PipelineResult {
 export type WorkerRequest =
   | { type: 'image'; version: number; width: number; height: number; data: Uint8ClampedArray }
   | { type: 'process'; id: number; params: PipelineParams }
-  | { type: 'png'; id: number; width: number; height: number; colors: (RGB | null)[] };
+  | { type: 'png'; id: number; width: number; height: number; colors: (RGB | null)[] }
+  | { type: '3mf'; id: number; cleanKey: string; options: Model3dOptions; objectName: string };
 
 export type WorkerResponse =
   | { type: 'progress'; id: number; stage: string }
   | { type: 'result'; id: number; result: PipelineResult }
   | { type: 'thin'; cleanKey: string; count: number; mask: Uint8Array }
   | { type: 'error'; id: number; message: string }
-  | { type: 'png'; id: number; blob: Blob | null; rgba: Uint8ClampedArray | null; width: number; height: number };
+  | { type: 'png'; id: number; blob: Blob | null; rgba: Uint8ClampedArray | null; width: number; height: number }
+  | { type: '3mf'; id: number; data: Uint8Array; parts: number };

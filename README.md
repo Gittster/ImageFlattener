@@ -5,8 +5,9 @@
 
 Turn a raster image into:
 
-1. a **flattened N-color PNG**, and
-2. a **layered SVG in real millimetres**, ready for multi-color 3D printing (one shape per filament color).
+1. a **flattened N-color PNG**,
+2. a **layered SVG in real millimetres**, ready for multi-color 3D printing (one shape per filament color), and
+3. a **ready-to-slice 3MF for Bambu Studio** with one solid part per color and the filament colors pre-assigned.
 
 Everything runs in your browser. The image is never uploaded anywhere; there is no backend.
 
@@ -91,10 +92,15 @@ The panel also shows the resulting mm-per-pixel resolution. It warns when a pixe
   * **Stacked**: each layer is its own color's region **plus the regions of every color stacked on top of it**, so each layer continues underneath the layers above it. The bottom layer is the full silhouette. Painting (or printing) the layers bottom-to-top reproduces the image. Layers overlap, which is the most forgiving option for printing and extrusion.
   * **Cutout**: non-overlapping shapes that tile the image exactly, for flush multi-material prints. **Bleed / overlap** (0–0.2 mm) grows every shape slightly into its neighbours, so slicer rounding can't open hairline gaps.
 * **Stack order**: drag (or use ↑/↓) to reorder. The list shows the top of the stack first. The default puts the largest-coverage color at the bottom.
+* **Sort dark → light** reorders the stack with the darkest color at the bottom, the usual order for HueForge-style prints.
+* **3D model heights** (used by the 3MF export):
+  * **Stacked:** the bottom color is a **base** slab (default 0.64 mm = 8 layers at 0.08 mm). Each further color adds a band (default **0.32 mm** = 4 layers). A color's part fills its band only where that color or any color above it appears. So parts never overlap, and from above every pixel shows its own color. The stack list shows each color's height band.
+  * **Cutout:** every part has the same **thickness** (default 1.2 mm) for a flush print.
 * **Background rect**: optionally adds a full-size `<rect id="background">` behind the layers.
 
 | Button | Output |
 |---|---|
+| **Bambu Studio 3MF** | A 3MF with **one object made of one solid part per color**, extruded to the heights above, and each part tagged with its color. Bambu Studio turns those colors into filament slots on import (see below). No printer or filament presets are included, so your own profiles apply. Cutout bleed is not applied to the 3MF: its parts already share exact borders. |
 | **Layered SVG** | One SVG with one `<g id="color-N-#RRGGBB" fill="#RRGGBB">` per color, in stack order (N = 1 is the bottom). No strokes. `width`/`height` are in mm with a matching `viewBox` (1 unit = 1 mm). The groups are also Inkscape layers. |
 | **Per-color SVGs (.zip)** | One SVG per color, all with identical size and viewBox, so they line up perfectly when imported separately. Also includes `settings.json`. |
 | **Flattened PNG** | The label map scaled nearest-neighbour to the original image resolution (capped at 8192 px on the long edge), with exactly N colors plus transparency. |
@@ -108,21 +114,32 @@ The panel also shows the resulting mm-per-pixel resolution. It warns when a pixe
 
 ## Importing into a slicer
 
-Export the **per-color ZIP** (or the layered SVG) at the print width you want. The SVG's millimetre size means it imports at the correct scale.
+### Bambu Studio: 3MF with colors already assigned (recommended)
 
-### Bambu Studio / OrcaSlicer
+1. Choose **Stacked** or **Cutout**, set the stack order and heights, and click **Bambu Studio 3MF**.
+2. Open the file in Bambu Studio (drag it onto the window, or **File → Open Project / Import**).
+3. Bambu Studio says the 3MF "is not from Bambu Lab" and loads its geometry and color data, then shows the **color-mapping dialog**. Its default action adds one new filament per color, set to that exact color, and assigns each part to it. Click **OK**.
+   * The colors in this file are **all distinct**, so the dialog never merges them (its automatic clustering keeps every distinct color when there are 32 or fewer).
+   * To reuse filaments you already have loaded (for example the spools in your AMS), use the dialog's **approximate match** option instead of adding new filaments.
+4. Pick your printer, process (a 0.08 mm layer profile suits stacked prints) and filament types, then **Slice**.
+
+**Version notes** (checked against Bambu Studio's source code):
+* **2.08.02 and newer**: each part is assigned to its filament directly, keeping part boundaries exact.
+* **2.05 to 2.08.01**: the same dialog appears, but colors are applied by painting each part's surfaces. The result looks the same.
+* **Older than 2.05**: there is no color import. You get one object with one part per color, each named `N #RRGGBB`. Assign a filament to each part in the object list: one click per color, not per island, because all islands of a color are a single part.
+
+If the model lands off the plate (for example on an A1 mini), press **A** (Arrange).
+
+### Bambu Studio / OrcaSlicer: from SVG
 Menu names differ slightly between versions, but the workflow is the same:
 
 1. Unzip the per-color SVGs.
 2. **File → Import → Import 3MF/STL/STEP/SVG/OBJ…** (Ctrl+I) and select **all** the per-color SVGs at once.
-3. When asked *"Load these files as a single object with multiple parts?"*, choose **Yes**. Each color becomes a **part** of one object, already aligned because all files share the same viewBox. Choosing *No* gives separate objects. Then select them all and use **Assemble**, or keep them aligned manually.
-4. In the object list, select each part and **assign a filament** (the color number/swatch column).
+3. When asked *"Load these files as a single object with multiple parts?"*, choose **Yes**. Each color becomes a **part** of one object, already aligned because all files share the same viewBox.
+4. In the object list, select each part and **assign a filament**.
 5. Set each part's height (scale Z, or the size fields in the object panel):
-   * **Stacked** export: give lower layers in the stack less height. For example, bottom = 1.0 mm, next = 1.4 mm, next = 1.8 mm. Each color then shows on top where it belongs, and the parts can overlap (overlapping parts are fine in a single multi-part object).
+   * **Stacked** export: give lower layers in the stack less height. For example, bottom = 1.0 mm, next = 1.4 mm, next = 1.8 mm. Each color then shows on top where it belongs; overlapping parts are fine in a single multi-part object.
    * **Cutout** export: give every part the same height for a flush print, and use a small bleed (0.05–0.1 mm) if you see gaps between colors.
-6. Alternatively, add a part to an existing object: right-click the object → **Add part → Load…**, then pick an SVG.
-
-> Tip: for a "lithophane-style" flat sign, a thin solid base (the bottom stacked layer) plus thin color layers on top uses very little filament-swap material.
 
 ### CAD (Fusion 360, Onshape, FreeCAD, OpenSCAD)
 Every layer is a set of closed, non-self-intersecting profiles in millimetres, so you can extrude each one to its own height.
@@ -171,6 +188,9 @@ src/
     cleanup.ts     mode filter, despeckle, connected components, EDT, thin features
     trace.ts       shared-edge tracing, simplification, Bézier fitting, loop assembly, bleed
     svg.ts         stacked/cutout layer sets and SVG document writer
+    mesh.ts        Bézier flattening, hole grouping, earcut triangulation, extrusion
+    model3d.ts     height bands and one extruded part per color
+    threemf.ts     3MF package writer (color group + one part per color)
   worker.ts      cached pipeline running in a Web Worker
   main.ts        UI
 samples/         sample images (bundled via ?url imports)

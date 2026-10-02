@@ -3,7 +3,10 @@ import { blurImage } from './core/blur';
 import { despeckle, modeFilter, thinFeatureSteps, type ThinFeatures } from './core/cleanup';
 import { applyGroups, countLabels } from './core/palette';
 import { quantize, type QuantizeResult } from './core/quantize';
+import { zipSync, strToU8 } from 'fflate';
+import { buildParts, type Model3dOptions } from './core/model3d';
 import { buildLayerPaths } from './core/svg';
+import { buildThreeMf } from './core/threemf';
 import { traceEdges, type EdgeGraph } from './core/trace';
 import { VOID, type LabelMap, type RasterImage } from './core/types';
 import type { PipelineParams, PipelineResult, VectorResult, WorkerRequest, WorkerResponse } from './protocol';
@@ -17,7 +20,7 @@ let quantCache: { key: string; result: QuantizeResult } | null = null;
 let cleanCache: { key: string; map: LabelMap; minFeaturePx: number; thin: ThinFeatures | null } | null = null;
 /** Incremented on every incoming message; background work stops when it changes. */
 let messageSerial = 0;
-let graphCache: { key: string; graph: EdgeGraph } | null = null;
+let graphCache: { key: string; cleanKey: string; graph: EdgeGraph } | null = null;
 let vectorCache: { key: string; result: VectorResult } | null = null;
 
 class StaleRequest extends Error {
@@ -66,7 +69,7 @@ function run(id: number, params: PipelineParams): PipelineResult {
     const gKey = JSON.stringify([cKey, v.tolerance, v.curves]);
     if (!graphCache || graphCache.key !== gKey) {
       post({ type: 'progress', id, stage: 'Tracing shapes…' });
-      graphCache = { key: gKey, graph: traceEdges(cleanCache.map, { tolerance: v.tolerance, curves: v.curves }) };
+      graphCache = { key: gKey, cleanKey: cKey, graph: traceEdges(cleanCache.map, { tolerance: v.tolerance, curves: v.curves }) };
     }
     // A stack made for a different palette is replaced by the default order.
     const valid =
@@ -154,6 +157,23 @@ function computeThinInBackground(): void {
   setTimeout(step, 0);
 }
 
+/** Bambu Studio-compatible 3MF built from the current traced shapes. */
+function render3mf(id: number, cleanKey: string, options: Model3dOptions, objectName: string): void {
+  try {
+    if (!graphCache || graphCache.cleanKey !== cleanKey) {
+      throw new Error('The preview is out of date; wait for it to finish updating and try again.');
+    }
+    const parts = buildParts(graphCache.graph, options);
+    const files = buildThreeMf({ objectName, parts });
+    const entries: Record<string, Uint8Array> = {};
+    for (const [name, content] of Object.entries(files)) entries[name] = strToU8(content);
+    const data = zipSync(entries, { level: 6 });
+    post({ type: '3mf', id, data, parts: parts.filter((p) => p.mesh.triangles.length > 0).length }, [data.buffer]);
+  } catch (err) {
+    post({ type: 'error', id, message: err instanceof Error ? err.message : String(err) });
+  }
+}
+
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const msg = e.data;
   messageSerial++;
@@ -168,6 +188,10 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   }
   if (msg.type === 'png') {
     void renderPng(msg.id, msg.width, msg.height, msg.colors);
+    return;
+  }
+  if (msg.type === '3mf') {
+    render3mf(msg.id, msg.cleanKey, msg.options, msg.objectName);
     return;
   }
   try {

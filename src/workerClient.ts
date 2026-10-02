@@ -1,4 +1,5 @@
 import type { RGB } from './core/color';
+import type { Model3dOptions } from './core/model3d';
 import type { PipelineParams, PipelineResult, WorkerRequest, WorkerResponse } from './protocol';
 
 /**
@@ -11,6 +12,7 @@ export class WorkerClient {
   private busyId = 0;
   private pending: PipelineParams | null = null;
   private readonly pngRequests = new Map<number, { resolve: (b: Blob) => void; reject: (e: Error) => void }>();
+  private readonly fileRequests = new Map<number, { resolve: (d: { data: Uint8Array; parts: number }) => void; reject: (e: Error) => void }>();
 
   onResult: (r: PipelineResult) => void = () => {};
   onProgress: (stage: string | null) => void = () => {};
@@ -50,6 +52,16 @@ export class WorkerClient {
     });
   }
 
+  /** Build a 3MF project from the current traced shapes. */
+  build3mf(cleanKey: string, options: Model3dOptions, objectName: string): Promise<{ data: Uint8Array; parts: number }> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.fileRequests.set(id, { resolve, reject });
+      const msg: WorkerRequest = { type: '3mf', id, cleanKey, options, objectName };
+      this.worker.postMessage(msg);
+    });
+  }
+
   private send(params: PipelineParams): void {
     const id = this.nextId++;
     this.busyId = id;
@@ -61,6 +73,13 @@ export class WorkerClient {
   private handle(msg: WorkerResponse): void {
     if (msg.type === 'thin') {
       this.onThin(msg.cleanKey, msg.count, msg.mask);
+      return;
+    }
+    const file = this.fileRequests.get(msg.id);
+    if (file) {
+      this.fileRequests.delete(msg.id);
+      if (msg.type === '3mf') file.resolve({ data: msg.data, parts: msg.parts });
+      else if (msg.type === 'error') file.reject(new Error(msg.message));
       return;
     }
     const png = this.pngRequests.get(msg.id);
