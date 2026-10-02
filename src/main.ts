@@ -5,6 +5,13 @@ import type { ExportMode, SvgLayer } from './core/svg';
 import { layerId, svgDocument } from './core/svg';
 import { baseName, downloadBlob, svgBlob, zipBlob } from './exporters';
 import { EXPORT_MAX } from './imageLoader';
+import { assignFilaments, filamentDistance } from './core/filaments';
+import { filamentLabel, getMyFilaments, myFilamentCount, openFilamentPicker } from './filamentPicker';
+
+const escHtml = (s: string): string => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!);
+const escAttr = (s: string): string => escHtml(s).replace(/"/g, '&quot;');
+const SPOOL_ICON =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="8" cy="8" r="2" fill="currentColor"/><path d="M8 1.5v4M8 10.5v4M1.5 8h4M10.5 8h4" stroke="currentColor" stroke-width="1"/></svg>';
 import { clusterGroups, entriesFromClusters, mergeEntries, resolveColors, type PaletteEntry } from './core/palette';
 import { VOID } from './core/types';
 import { loadImage, type LoadedImage } from './imageLoader';
@@ -49,10 +56,14 @@ app.innerHTML = `
       <div id="palette" class="palette"></div>
       <div class="row">
         <button id="merge-btn" disabled title="Merge the checked colors into one">Merge selected</button>
-        <button id="reset-palette-btn" title="Undo merges and color overrides">Reset</button>
+        <button id="reset-palette-btn" title="Undo merges, color overrides and filament choices">Reset</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button id="match-mine-btn" title="Give every color the closest filament from your own list (each filament used once when possible)">Match to my filaments</button>
+        <button id="my-filaments-btn" title="Choose the filaments you own">My filaments…</button>
       </div>
       <label class="check" style="margin-top:8px"><input id="force-bw" type="checkbox" /> Force darkest/lightest to pure black/white</label>
-      <div class="hint">Click a swatch to override its output color. Overrides don't change which pixels belong to it.</div>
+      <div class="hint">Click a swatch to override its output color, or the spool button to pick a real filament. Either only changes the output color, not which pixels belong to it.</div>
     </section>
     <section>
       <h2>Cleanup</h2>
@@ -668,7 +679,10 @@ $('export-3mf').addEventListener('click', async () => {
         mode: state.mode,
         stack,
         colors: stack.map((i) => hex[i]),
-        names: stack.map((i, k) => `${k + 1} ${hex[i]}`),
+        names: stack.map((i, k) => {
+          const f = state.entries[i].filament;
+          return `${k + 1} ${f ? `${filamentLabel(f)} ${f.hex}` : hex[i]}`;
+        }),
         mmPerPx: 1 / derived().pxPerMm,
         ...heightOptions(),
         orientation: effectiveOrientation(),
@@ -710,6 +724,9 @@ function settingsJson(): string {
       color: hex[i],
       clusterColor: rgbToHex(e.base),
       overridden: e.override !== null,
+      filament: e.filament
+        ? { brand: e.filament.brand, material: e.filament.material, name: e.filament.name, color: e.filament.hex, source: e.filament.custom ? 'custom' : 'SpoolmanDB' }
+        : null,
       coveragePercent: total > 0 && r ? Math.round((10000 * r.counts[i]) / total) / 100 : 0,
       // null when cleanup removed every pixel of this color (not exported).
       stackPosition: stack.includes(i) ? stack.indexOf(i) + 1 : null,
@@ -839,17 +856,33 @@ function renderPalette(): void {
     const row = document.createElement('div');
     row.className = 'swatch-row';
     const pct = total > 0 && r ? (100 * (r.counts[i] ?? 0)) / total : 0;
-    const overridden = e.override !== null;
+    const overridden = e.override !== null || !!e.filament;
+    const fil = e.filament;
     row.innerHTML = `
       <input type="checkbox" aria-label="Select color ${i + 1}" ${state.selected.has(i) ? 'checked' : ''} />
       <button class="swatch" title="Click to override the output color" style="background:${hex[i]}"></button>
       <input type="color" value="${hex[i].toLowerCase()}" hidden />
-      <span class="hex">${hex[i]}${overridden ? ' <span class="tag">edited</span>' : ''}</span>
+      <span class="hex">${hex[i]}${e.override !== null && !fil ? ' <span class="tag">edited</span>' : ''}${
+        fil ? `<span class="fil" title="${escAttr(filamentLabel(fil))} (${fil.hex}), cluster color ${rgbToHex(e.base)}">${escHtml(`${fil.name} · ${fil.brand}${fil.material ? ' ' + fil.material : ''}`)}</span>` : ''
+      }</span>
       <span class="pct" ${r && r.counts[i] === 0 ? 'title="Removed entirely by cleanup; not exported"' : ''}>${
         r && r.counts[i] === 0 ? 'removed' : pct < 0.1 ? '<0.1%' : `${pct.toFixed(1)}%`
       }</span>
-      <button class="mini" title="Revert to cluster color" ${overridden ? '' : 'hidden'}>↺</button>`;
-    const [check, swatch, picker, , , revert] = [...row.children] as HTMLElement[];
+      <button class="mini" title="Revert to cluster color" ${overridden ? '' : 'hidden'}>↺</button>
+      <button class="mini spool ${fil ? 'on' : ''}" title="Pick a real filament for this color" aria-label="Pick a filament">${SPOOL_ICON}</button>`;
+    const [check, swatch, picker, , , revert, spool] = [...row.children] as HTMLElement[];
+    spool.addEventListener('click', () => {
+      void openFilamentPicker({
+        targetHex: rgbToHex(e.base),
+        current: e.filament ?? null,
+        onPick: (f) => {
+          e.filament = f;
+          if (f) e.override = null;
+          renderResult();
+        },
+        onMineChange: updateMyFilamentsButton,
+      });
+    });
     check.addEventListener('change', () => {
       if ((check as HTMLInputElement).checked) state.selected.add(i);
       else state.selected.delete(i);
@@ -858,6 +891,7 @@ function renderPalette(): void {
     swatch.addEventListener('click', () => (picker as HTMLInputElement).click());
     picker.addEventListener('input', () => {
       e.override = (picker as HTMLInputElement).value.toUpperCase();
+      e.filament = null;
       (swatch as HTMLElement).style.background = e.override;
       if (state.result) renderRaster(state.result);
       renderStack();
@@ -866,6 +900,7 @@ function renderPalette(): void {
     picker.addEventListener('change', () => renderResult());
     revert.addEventListener('click', () => {
       e.override = null;
+      e.filament = null;
       renderResult();
     });
     el.appendChild(row);
@@ -903,6 +938,52 @@ function bindRange(id: string, fmt: (v: number) => string, apply: (v: number) =>
 
 const setColors = bindRange('colors', (v) => String(v), (v) => (state.colors = v));
 const setBlur = bindRange('blur', (v) => (v === 0 ? 'off' : `${v} px`), (v) => (state.blur = v));
+function updateMyFilamentsButton(): void {
+  const n = myFilamentCount();
+  $('my-filaments-btn').textContent = n ? `My filaments (${n})…` : 'My filaments…';
+}
+updateMyFilamentsButton();
+
+$('my-filaments-btn').addEventListener('click', () => {
+  void openFilamentPicker({ onMineChange: updateMyFilamentsButton });
+});
+
+$('match-mine-btn').addEventListener('click', async () => {
+  const mine = await getMyFilaments();
+  if (mine.length === 0) {
+    void openFilamentPicker({
+      onMineChange: updateMyFilamentsButton,
+      notice: 'Your filament list is empty. Star (☆) the spools you own, or add custom ones below, then use "Match to my filaments" again.',
+    });
+    return;
+  }
+  const r = resultInSync() ? state.result : null;
+  // Match colors that are actually exported, largest coverage first.
+  const targets = state.entries
+    .map((e, i) => ({ e, i, n: r?.counts[i] ?? 1 }))
+    .filter((t) => t.n > 0)
+    .sort((a, b) => b.n - a.n);
+  const picks = assignFilaments(
+    targets.map((t) => rgbToHex(t.e.base)),
+    mine,
+  );
+  let worst = 0;
+  targets.forEach((t, k) => {
+    const f = mine[picks[k]];
+    if (!f) return;
+    t.e.filament = f;
+    t.e.override = null;
+    worst = Math.max(worst, filamentDistance(rgbToHex(t.e.base), f));
+  });
+  const shared = targets.length > mine.length;
+  renderResult();
+  setStatus(
+    `Matched ${targets.length} color${targets.length === 1 ? '' : 's'} to your filaments (largest difference ΔE ${worst.toFixed(1)}).` +
+      (shared ? ' You have fewer filaments than colors, so some colors share a filament; consider merging them or reducing the number of colors.' : ''),
+    shared || worst > 10 ? 'warn' : 'info',
+  );
+});
+
 $('merge-btn').addEventListener('click', () => {
   const q = state.result?.quant;
   if (!q || state.selected.size < 2) return;

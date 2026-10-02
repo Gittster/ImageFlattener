@@ -86,3 +86,60 @@ export function hexToRgb(hex: string): RGB {
 export function lightness([r, g, b]: RGB): number {
   return rgbToLab(r, g, b)[0];
 }
+
+/**
+ * CIEDE2000 color difference between two CIELAB colors (kL = kC = kH = 1).
+ * Roughly: < 1 imperceptible, 1-2 close inspection, 2-5 noticeable, > 10 different colors.
+ */
+export function deltaE2000([L1, a1, b1]: Lab, [L2, a2, b2]: Lab): number {
+  const rad = Math.PI / 180;
+  const C1 = Math.hypot(a1, b1);
+  const C2 = Math.hypot(a2, b2);
+  const Cm = (C1 + C2) / 2;
+  const Cm7 = Cm ** 7;
+  const G = 0.5 * (1 - Math.sqrt(Cm7 / (Cm7 + 25 ** 7)));
+  const ap1 = a1 * (1 + G);
+  const ap2 = a2 * (1 + G);
+  const Cp1 = Math.hypot(ap1, b1);
+  const Cp2 = Math.hypot(ap2, b2);
+  const hue = (b: number, ap: number): number => {
+    if (b === 0 && ap === 0) return 0;
+    const h = Math.atan2(b, ap) / rad;
+    return h < 0 ? h + 360 : h;
+  };
+  const hp1 = hue(b1, ap1);
+  const hp2 = hue(b2, ap2);
+  const dL = L2 - L1;
+  const dC = Cp2 - Cp1;
+  let dh = 0;
+  if (Cp1 * Cp2 !== 0) {
+    dh = hp2 - hp1;
+    if (dh > 180) dh -= 360;
+    else if (dh < -180) dh += 360;
+  }
+  const dH = 2 * Math.sqrt(Cp1 * Cp2) * Math.sin((dh / 2) * rad);
+  const Lm = (L1 + L2) / 2;
+  const Cpm = (Cp1 + Cp2) / 2;
+  let hm = hp1 + hp2;
+  if (Cp1 * Cp2 !== 0) {
+    if (Math.abs(hp1 - hp2) > 180) hm += hp1 + hp2 < 360 ? 360 : -360;
+    hm /= 2;
+  }
+  const T =
+    1 -
+    0.17 * Math.cos((hm - 30) * rad) +
+    0.24 * Math.cos(2 * hm * rad) +
+    0.32 * Math.cos((3 * hm + 6) * rad) -
+    0.2 * Math.cos((4 * hm - 63) * rad);
+  const dTheta = 30 * Math.exp(-(((hm - 275) / 25) ** 2));
+  const Cpm7 = Cpm ** 7;
+  const RC = 2 * Math.sqrt(Cpm7 / (Cpm7 + 25 ** 7));
+  const SL = 1 + (0.015 * (Lm - 50) ** 2) / Math.sqrt(20 + (Lm - 50) ** 2);
+  const SC = 1 + 0.045 * Cpm;
+  const SH = 1 + 0.015 * Cpm * T;
+  const RT = -Math.sin(2 * dTheta * rad) * RC;
+  const tL = dL / SL;
+  const tC = dC / SC;
+  const tH = dH / SH;
+  return Math.sqrt(tL * tL + tC * tC + tH * tH + RT * tC * tH);
+}

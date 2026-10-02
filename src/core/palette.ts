@@ -1,4 +1,5 @@
 import { labToRgb, rgbToHex, rgbToLab, type RGB } from './color';
+import type { Filament } from './filaments';
 import { VOID } from './types';
 
 export interface PaletteEntry {
@@ -10,10 +11,12 @@ export interface PaletteEntry {
   base: RGB;
   /** User override (output color only), as #RRGGBB. */
   override: string | null;
+  /** A real filament chosen for this color; its color wins over `override`. */
+  filament?: Filament | null;
 }
 
 export function entriesFromClusters(centroids: RGB[]): PaletteEntry[] {
-  return centroids.map((c, i) => ({ id: i, clusters: [i], base: c, override: null }));
+  return centroids.map((c, i) => ({ id: i, clusters: [i], base: c, override: null, filament: null }));
 }
 
 /** Map from cluster index to palette entry index. */
@@ -51,16 +54,23 @@ export function mergeEntries(
     clusters,
     base: labToRgb(L / W, A / W, B / W),
     override: target.override,
+    filament: target.filament ?? null,
   };
   return entries.flatMap((e, i) => (i === sel[0] ? [merged] : sel.includes(i) ? [] : [e]));
 }
 
+/** True when the entry's output color was chosen explicitly (filament or override). */
+export function isPinned(e: PaletteEntry): boolean {
+  return !!e.filament || e.override !== null;
+}
+
 /**
- * Resolve the output color of each entry: user override wins, then the
- * optional black/white pinning of the darkest/lightest entry, then the cluster color.
+ * Resolve the output color of each entry: a chosen filament wins, then a user
+ * override, then the optional black/white pinning of the darkest/lightest
+ * entry, then the cluster color.
  */
 export function resolveColors(entries: PaletteEntry[], forceBW: boolean): string[] {
-  const out = entries.map((e) => e.override ?? rgbToHex(e.base));
+  const out = entries.map((e) => (e.filament?.hex ?? e.override ?? rgbToHex(e.base)).toUpperCase());
   if (forceBW && entries.length >= 1) {
     const L = entries.map((e) => rgbToLab(...e.base)[0]);
     let dark = 0, light = 0;
@@ -70,11 +80,11 @@ export function resolveColors(entries: PaletteEntry[], forceBW: boolean): string
     });
     if (entries.length === 1) {
       // A single color: pin to whichever extreme it is closer to.
-      if (!entries[0].override) out[0] = L[0] < 50 ? '#000000' : '#FFFFFF';
+      if (!isPinned(entries[0])) out[0] = L[0] < 50 ? '#000000' : '#FFFFFF';
       return out;
     }
-    if (!entries[dark].override) out[dark] = '#000000';
-    if (!entries[light].override) out[light] = '#FFFFFF';
+    if (!isPinned(entries[dark])) out[dark] = '#000000';
+    if (!isPinned(entries[light])) out[light] = '#FFFFFF';
   }
   return out;
 }
