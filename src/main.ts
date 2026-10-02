@@ -97,7 +97,7 @@ app.innerHTML = `
       <summary><span>Cleanup</span><span class="sum" id="sum-cleanup"></span></summary>
       <div class="field">
         <label for="mode">Smooth edges (mode filter) <output id="mode-out"></output></label>
-        <input id="mode" type="range" min="0" max="3" step="1" value="1" />
+        <input id="mode" type="range" min="0" max="3" step="1" value="0" />
       </div>
       <label class="check"><input id="despeckle" type="checkbox" checked /> Despeckle</label>
       <div class="field">
@@ -286,7 +286,8 @@ const state: State = {
   entries: [],
   selected: new Set(),
   forceBW: false,
-  modeFilter: 1,
+  // Off by default: the 3x3 majority filter rounds off sharp tips and corners.
+  modeFilter: 0,
   despeckle: true,
   despeckleAuto: true,
   despeckleMm: 0.6,
@@ -1551,8 +1552,10 @@ $<HTMLSelectElement>('sample-select').addEventListener('change', async (e) => {
     if (!res.ok) throw new Error(`Failed to load sample (${res.status})`);
     state.colors = sample.colors;
     state.blur = sample.blur;
+    state.modeFilter = sample.modeFilter;
     setColors(sample.colors);
     setBlur(sample.blur);
+    setModeFilter(sample.modeFilter);
     await openBlob(await res.blob(), sample.url.split('/').pop()!.replace(/-[\w-]{8}\./, '.'));
   } catch (err) {
     setStatus(err instanceof Error ? err.message : String(err), 'error');

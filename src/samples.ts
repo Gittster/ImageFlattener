@@ -10,10 +10,12 @@ export interface Sample {
   url: string;
   colors: number;
   blur: number;
+  /** Smooth-edges passes: photos benefit, flat artwork keeps sharper corners without. */
+  modeFilter: number;
 }
 
 export const SAMPLES: Sample[] = [
-  { id: 'logo', label: 'Flat-color logo', url: logoUrl, colors: 5, blur: 0 },
-  { id: 'photo', label: 'Photo (sunset)', url: photoUrl, colors: 6, blur: 1.5 },
-  { id: 'sticker', label: 'Sticker with transparency', url: stickerUrl, colors: 4, blur: 0 },
+  { id: 'logo', label: 'Flat-color logo', url: logoUrl, colors: 5, blur: 0, modeFilter: 0 },
+  { id: 'photo', label: 'Photo (sunset)', url: photoUrl, colors: 6, blur: 1.5, modeFilter: 1 },
+  { id: 'sticker', label: 'Sticker with transparency', url: stickerUrl, colors: 4, blur: 0, modeFilter: 0 },
 ];

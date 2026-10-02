@@ -140,6 +140,35 @@ describe('vector layers', () => {
   });
 });
 
+describe('corner reconstruction', () => {
+  it('keeps the points and inner corners of a pixelated star sharp', () => {
+    const w = 200, h = 200;
+    const cx = 100, cy = 104;
+    const star: [number, number][] = [];
+    for (let i = 0; i < 10; i++) {
+      const r = i % 2 ? 34 : 88, t = -Math.PI / 2 + (i * Math.PI) / 5;
+      star.push([cx + r * Math.cos(t), cy + r * Math.sin(t)]);
+    }
+    const inStar = (x: number, y: number): boolean => {
+      let c = false;
+      for (let i = 0, j = star.length - 1; i < star.length; j = i++) {
+        const [xi, yi] = star[i], [xj, yj] = star[j];
+        if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) c = !c;
+      }
+      return c;
+    };
+    const labels = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) labels[y * w + x] = inStar(x + 0.5, y + 0.5) ? 1 : 0;
+    const graph = traceEdges({ width: w, height: h, labels }, { tolerance: 1, curves: true });
+    const [loop] = regionLoops(graph, (l) => l === 1);
+    const anchors = Array.from(loop.px, (x, i) => [x, loop.py[i]]);
+    for (const [sx, sy] of star) {
+      const nearest = Math.min(...anchors.map(([x, y]) => Math.hypot(x - sx, y - sy)));
+      expect(nearest).toBeLessThan(1.5);
+    }
+  });
+});
+
 describe('SVG document', () => {
   it('uses mm units, a matching viewBox, and one group per color in stack order', () => {
     const svg = svgDocument({

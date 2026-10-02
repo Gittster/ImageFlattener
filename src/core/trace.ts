@@ -295,6 +295,63 @@ function simplifyRing(pts: number[], tol: number): number[] {
 }
 
 /**
+ * Rebuild sharp corners that pixelation and simplification cut off. A corner
+ * on the pixel grid usually comes out of simplification as a short segment
+ * (a flat tip or a notch) between two long ones. When the two long segments
+ * turn by more than the corner angle, the short segment is replaced by the
+ * point where the long segments' lines intersect, which is marked as a sharp
+ * corner. The end points of open chains (shared junctions) never move.
+ */
+export function sharpenCorners(
+  s: { pts: number[]; locked: boolean[] },
+  closed: boolean,
+  cornerCos: number,
+  maxShort: number,
+): { pts: number[]; locked: boolean[] } {
+  const pts = s.pts.slice();
+  const locked = Array.from({ length: pts.length / 2 }, (_, i) => !!s.locked[i]);
+  const len = (i: number, j: number): number => Math.hypot(pts[j * 2] - pts[i * 2], pts[j * 2 + 1] - pts[i * 2 + 1]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const n = pts.length / 2;
+    if (n < (closed ? 5 : 4)) break;
+    for (let a = closed ? 0 : 1; a < (closed ? n : n - 2); a++) {
+      const b = (a + 1) % n;
+      const pa = (a - 1 + n) % n;
+      const nb = (b + 1) % n;
+      const short = len(a, b);
+      if (short > maxShort) continue;
+      const l1 = len(pa, a);
+      const l2 = len(b, nb);
+      // Both neighbours must be clearly longer, so small shapes keep their form.
+      // (On curves all segments have similar lengths, so they are left alone.)
+      if (l1 < 2.5 * short || l2 < 2.5 * short || l1 < maxShort || l2 < maxShort) continue;
+      const d1x = (pts[a * 2] - pts[pa * 2]) / l1, d1y = (pts[a * 2 + 1] - pts[pa * 2 + 1]) / l1;
+      const d2x = (pts[nb * 2] - pts[b * 2]) / l2, d2y = (pts[nb * 2 + 1] - pts[b * 2 + 1]) / l2;
+      if (d1x * d2x + d1y * d2y >= cornerCos) continue; // not a sharp enough turn
+      const det = d1x * d2y - d1y * d2x;
+      if (Math.abs(det) < 1e-9) continue; // parallel: a step, not a corner
+      // Intersect a + t*d1 with b + u*d2.
+      const wx = pts[b * 2] - pts[a * 2], wy = pts[b * 2 + 1] - pts[a * 2 + 1];
+      const t = (wx * d2y - wy * d2x) / det;
+      const u = (wx * d1y - wy * d1x) / det;
+      // The corner must lie ahead of `a` and behind `b`, and not too far away.
+      if (t < -1e-9 || u > 1e-9 || t > 4 * maxShort || -u > 4 * maxShort) continue;
+      const x = pts[a * 2] + t * d1x, y = pts[a * 2 + 1] + t * d1y;
+      pts[a * 2] = x;
+      pts[a * 2 + 1] = y;
+      locked[a] = true;
+      pts.splice(b * 2, 2);
+      locked.splice(b, 1);
+      changed = true;
+      break;
+    }
+  }
+  return { pts, locked };
+}
+
+/**
  * Turn a point chain into cubic segments. Open chains keep their end points
  * fixed (they are shared junctions) and use one-sided tangents there.
  */
@@ -306,7 +363,12 @@ function buildSegments(
   curves: boolean,
   cornerCos: number,
 ): Float64Array {
-  const simplified = closed ? simplifyClosed(pts, locked, tol) : simplifyLocked(pts, locked, tol);
+  const simplified = sharpenCorners(
+    closed ? simplifyClosed(pts, locked, tol) : simplifyLocked(pts, locked, tol),
+    closed,
+    cornerCos,
+    2 + 4 * tol,
+  );
   const p = simplified.pts;
   const isLocked = simplified.locked;
   const n = p.length / 2;

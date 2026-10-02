@@ -45,6 +45,7 @@ image ─► downscale (≤1500 px) ─► optional blur ─► k-means in CIELA
   * Each edge is simplified (Douglas-Peucker) and fitted with cubic Béziers **once**. Every region's outline is then assembled from those shared edges.
   * Neighbouring colors therefore agree exactly on their common border. Cutout shapes tile with no slivers or gaps, and stacked unions reuse the same geometry.
   * Tracing each color independently (as per-color Potrace does) can't guarantee this.
+* **Corner reconstruction:** pixelation and simplification turn a sharp corner into a short flat or notch between two long edges. When the two long edges meet at a sharp angle (more than 60°), the short piece is replaced by the point where their lines cross. That keeps star points and inner corners crisp. Curves are left alone, because their segments are all similar lengths.
 * Holes are emitted as proper compound paths: holes wind opposite to outer boundaries and the paths use `fill-rule="nonzero"`.
 
 ## Settings
@@ -78,7 +79,7 @@ Clustering happens in **CIELAB**, so colors are grouped by perceived similarity.
 ### Cleanup
 | Setting | What it does |
 |---|---|
-| **Smooth edges (mode filter)** | 0–3 passes of a 3×3 majority filter. Rounds jagged edges and removes single-pixel noise. |
+| **Smooth edges (mode filter)** | 0–3 passes of a 3×3 majority filter. Removes single-pixel noise and jaggies, but also rounds off sharp tips and inner corners. **Off by default.** It's useful for noisy photos; the photo sample uses 1 pass. |
 | **Despeckle** | Removes connected regions smaller than the given size (in **mm**, as a square of that side at the chosen print size). Each speck is merged into the neighbour it shares the longest border with. By default the size equals the min feature size. |
 | **Thin-feature warning** | After cleanup, reports how many features are still narrower than the min feature size: regions that a disk of that diameter can't reach. **Highlight thin features** marks them in magenta on the raster preview. Fix them with more smoothing, a larger print, merging colors, or fewer colors. |
 

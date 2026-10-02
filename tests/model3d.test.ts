@@ -100,7 +100,7 @@ describe('orientation and backing', () => {
   const w = 20, h = 10;
   const labels = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) labels[y * w + x] = x < 10 ? 0 : 1;
-  labels[0] = VOID;
+  for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) labels[y * w + x] = VOID; // transparent 3x3 corner
   const graph = traceEdges({ width: w, height: h, labels }, { tolerance: 0.5, curves: false });
   const opts = { baseMm: 0.6, stepMm: 0.3, cutoutMm: 1, mmPerPx: 1, stack: [0, 1], colors: ['#000000', '#FFFFFF'], names: ['a', 'b'] };
   const bounds = (m: Mesh): { x: [number, number]; z: [number, number] } => {
@@ -114,8 +114,8 @@ describe('orientation and backing', () => {
     expect(parts.map((p) => p.name)).toEqual(['Backing #FF0000', 'a', 'b']);
     expect(bounds(parts[0].mesh).z).toEqual([0, 0.5]);
     expect(bounds(parts[1].mesh).z).toEqual([0.5, 1.5]);
-    // The backing covers the whole silhouette (both colors), minus the transparent pixel.
-    expect(meshVolume(parts[0].mesh)).toBeCloseTo((w * h - 1) * 0.5, 0);
+    // The backing covers the whole silhouette (both colors), minus the transparent corner.
+    expect(meshVolume(parts[0].mesh)).toBeCloseTo((w * h - 9) * 0.5, 6);
     for (const p of parts) expect(isClosedManifold(p.mesh) && meshVolume(p.mesh) > 0).toBe(true);
   });
 
