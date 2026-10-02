@@ -59,6 +59,15 @@ describe('k-means quantization', () => {
     expect(q.counts).toEqual([8, 8]);
   });
 
+  it('merges clusters that are visually indistinguishable', () => {
+    // Two near-identical oranges (anti-aliasing rounding) and one blue, with k = 4.
+    const data = new Uint8ClampedArray(30 * 4);
+    for (let i = 0; i < 30; i++) data.set(i < 10 ? [244, 162, 97, 255] : i < 20 ? [243, 160, 96, 255] : [30, 50, 90, 255], i * 4);
+    const q = quantize({ width: 30, height: 1, data }, { k: 4, seed: 1 });
+    expect(q.centroids).toHaveLength(2);
+    expect(q.counts).toEqual([20, 10]);
+  });
+
   it('handles a 1-pixel image', () => {
     const q = quantize(solid(1, 1, [10, 20, 30, 255]), { k: 4, seed: 1 });
     expect(q.centroids).toEqual([[10, 20, 30]]);

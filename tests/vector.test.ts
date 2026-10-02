@@ -169,6 +169,68 @@ describe('corner reconstruction', () => {
   });
 });
 
+describe('curve accuracy', () => {
+  // Rasterize an analytic shape, trace it, and measure how far the curves stray from the true edge.
+  const trace = (inside: (x: number, y: number) => boolean, dist: (x: number, y: number) => number) => {
+    const w = 200, h = 200;
+    const labels = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) labels[y * w + x] = inside(x + 0.5, y + 0.5) ? 1 : 0;
+    const graph = traceEdges({ width: w, height: h, labels }, { tolerance: 1, curves: true });
+    let max = 0, sum = 0, n = 0;
+    for (const poly of regionLoops(graph, (l) => l === 1).map((l) => flattenLoop(l, 24))) {
+      for (const [x, y] of poly) {
+        const d = dist(x, y);
+        max = Math.max(max, d);
+        sum += d * d;
+        n++;
+      }
+    }
+    return { max, rms: Math.sqrt(sum / n) };
+  };
+
+  it.each([10, 46, 92])('a circle of radius %i px is traced within 0.35 px', (r) => {
+    const c = r + 6;
+    const e = trace((x, y) => (x - c) ** 2 + (y - c) ** 2 < r * r, (x, y) => Math.abs(Math.hypot(x - c, y - c) - r));
+    expect(e.max).toBeLessThan(0.35);
+    expect(e.rms).toBeLessThan(0.2);
+  });
+
+  it('an ellipse is traced within 0.35 px', () => {
+    const f = (x: number, y: number): number => ((x - 70) / 60) ** 2 + ((y - 45) / 30) ** 2 - 1;
+    const e = trace(
+      (x, y) => f(x, y) < 0,
+      (x, y) => Math.abs(f(x, y)) / Math.hypot((2 * (x - 70)) / 3600, (2 * (y - 45)) / 900),
+    );
+    expect(e.max).toBeLessThan(0.35);
+    expect(e.rms).toBeLessThan(0.2);
+  });
+
+  it('a closed shape with a single corner (teardrop) keeps its outline', () => {
+    // Convex hull of a circle (center C, radius r) and a tip T.
+    const C = [100, 120], r = 40, T = [100, 20];
+    const L = Math.hypot(C[0] - T[0], C[1] - T[1]);
+    const a = Math.acos(r / L); // half-angle at C between CT and a tangent point
+    const tangents = [-a, a].map((s) => [C[0] + r * Math.sin(s), C[1] - r * Math.cos(s)]);
+    const cross = (o: number[], p: number[], q: number[]): number => (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0]);
+    const inTri = (x: number, y: number): boolean =>
+      cross(T, tangents[0], [x, y]) * cross(T, tangents[1], [x, y]) <= 0 && y >= T[1] && y <= tangents[0][1];
+    const w = 200, h = 200;
+    const labels = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const px = x + 0.5, py = y + 0.5;
+        labels[y * w + x] = Math.hypot(px - C[0], py - C[1]) < r || inTri(px, py) ? 1 : 0;
+      }
+    const loops = regionLoops(traceEdges({ width: w, height: h, labels }, { tolerance: 1, curves: true }), (l) => l === 1);
+    expect(loops).toHaveLength(1);
+    const exact = Math.PI * r * r - r * r * a + r * Math.sqrt(L * L - r * r);
+    expect(Math.abs(loopArea(loops[0])) / exact).toBeCloseTo(1, 2);
+    // The tip survives as an anchor.
+    const tip = [...loops[0].px.keys()].some((i) => Math.hypot(loops[0].px[i] - T[0], loops[0].py[i] - T[1]) < 1.5);
+    expect(tip).toBe(true);
+  });
+});
+
 describe('SVG document', () => {
   it('uses mm units, a matching viewBox, and one group per color in stack order', () => {
     const svg = svgDocument({

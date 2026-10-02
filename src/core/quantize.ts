@@ -1,9 +1,12 @@
-import { labToRgb, rgbToLab, type RGB } from './color';
+import { deltaE2000, labToRgb, rgbToLab, type RGB } from './color';
 import { mulberry32 } from './rng';
 import { VOID, type RasterImage } from './types';
 
 /** Pixels with alpha below this are treated as transparent (VOID). */
 export const ALPHA_THRESHOLD = 128;
+
+/** Clusters closer than this CIEDE2000 distance are merged (indistinguishable). */
+export const MERGE_DE = 2;
 
 /** Above this many distinct colors, colors are binned to 6 bits per channel. */
 const MAX_EXACT_COLORS = 65536;
@@ -221,6 +224,27 @@ export function quantize(img: RasterImage, opts: QuantizeOptions): QuantizeResul
   // Count pixels per cluster and drop empty clusters.
   const counts = new Array<number>(k).fill(0);
   for (let i = 0; i < assign.length; i++) counts[assign[i]] += hist.weight[i];
+
+  // Merge clusters the eye can't tell apart (CIEDE2000 < MERGE_DE). Flat
+  // artwork with anti-aliased edges otherwise splits one color into several
+  // near-identical ones when k exceeds the real number of colors.
+  const byCount = [...Array(k).keys()].filter((c) => counts[c] > 0).sort((a, b) => counts[b] - counts[a] || a - b);
+  const mergedInto = Int32Array.from({ length: k }, (_, i) => i);
+  const lab = (c: number): [number, number, number] => [centers[c * 3], centers[c * 3 + 1], centers[c * 3 + 2]];
+  for (let x = 0; x < byCount.length; x++) {
+    const a = byCount[x];
+    if (mergedInto[a] !== a) continue;
+    for (let y = x + 1; y < byCount.length; y++) {
+      const b = byCount[y];
+      if (mergedInto[b] !== b || deltaE2000(lab(a), lab(b)) >= MERGE_DE) continue;
+      const wa = counts[a], wb = counts[b];
+      for (let d = 0; d < 3; d++) centers[a * 3 + d] = (centers[a * 3 + d] * wa + centers[b * 3 + d] * wb) / (wa + wb);
+      counts[a] += wb;
+      counts[b] = 0;
+      mergedInto[b] = a;
+    }
+  }
+  for (let i = 0; i < assign.length; i++) assign[i] = mergedInto[assign[i]];
   const order = [...Array(k).keys()].filter((c) => counts[c] > 0).sort((a, b) => counts[b] - counts[a] || a - b);
   const remap = new Int32Array(k).fill(-1);
   order.forEach((c, i) => (remap[c] = i));

@@ -38,6 +38,40 @@ export function flattenLoop(lp: Loop, maxSegment: number): number[] {
   return dedupe(out);
 }
 
+/**
+ * Remove points that lie on the straight line through their neighbours
+ * (including zero-width spikes and repeated points).
+ * Earcut skips such points when triangulating, so the caps would not share
+ * edges with the side walls and the solid would not be closed.
+ */
+export function removeCollinear(p: number[]): number[] {
+  let pts = p.slice();
+  let changed = true;
+  while (changed && pts.length >= 8) {
+    changed = false;
+    const n = pts.length / 2;
+    const keep: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i - 1 + n) % n, c = (i + 1) % n;
+      const ax = pts[i * 2] - pts[a * 2], ay = pts[i * 2 + 1] - pts[a * 2 + 1];
+      const bx = pts[c * 2] - pts[i * 2], by = pts[c * 2 + 1] - pts[i * 2 + 1];
+      const cross = ax * by - ay * bx;
+      const scale = Math.hypot(ax, ay) * Math.hypot(bx, by);
+      // Collinear: either continuing straight on, or a zero-width spike that
+      // goes out and comes straight back (no area either way). Also drops
+      // repeated points (zero-length steps).
+      if (Math.abs(cross) <= 1e-9 * scale) {
+        changed = true;
+        continue;
+      }
+      keep.push(pts[i * 2], pts[i * 2 + 1]);
+    }
+    if (keep.length < 6) break;
+    pts = dedupe(keep);
+  }
+  return pts;
+}
+
 /** Drop consecutive duplicate points (including last == first). */
 function dedupe(p: number[]): number[] {
   const out: number[] = [];
@@ -143,7 +177,8 @@ export function extrudePolygons(mesh: Mesh, polygons: PolygonWithHoles[], z0: nu
       const cross =
         (flat[b * 2] - flat[a * 2]) * (flat[c * 2 + 1] - flat[a * 2 + 1]) -
         (flat[b * 2 + 1] - flat[a * 2 + 1]) * (flat[c * 2] - flat[a * 2]);
-      if (cross === 0) continue;
+      // Zero-area triangles (collinear points on a ring) are kept: dropping
+      // them would leave unmatched edges and break the closed surface.
       if (cross < 0) [b, c] = [c, b]; // make counter-clockwise
       tri.push(top + a, top + b, top + c); // top faces up
       tri.push(bottom + a, bottom + c, bottom + b); // bottom faces down
@@ -166,6 +201,89 @@ export function extrudePolygons(mesh: Mesh, polygons: PolygonWithHoles[], z0: nu
 }
 
 /**
+ * Where outlines touch at a single point (pixels meeting only at a corner),
+ * the same position occurs more than once. Move every such occurrence a
+ * tenth of a micron towards its own neighbours so the outlines no longer
+ * touch; otherwise the walls at that point would be shared by four faces.
+ */
+function separatePinches(rings: number[][]): void {
+  const count = new Map<string, number>();
+  for (const r of rings) for (let i = 0; i < r.length; i += 2) {
+    const k = `${r[i]},${r[i + 1]}`;
+    count.set(k, (count.get(k) ?? 0) + 1);
+  }
+  const EPS = 1e-4;
+  for (const r of rings) {
+    const n = r.length / 2;
+    const moved: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if ((count.get(`${r[i * 2]},${r[i * 2 + 1]}`) ?? 0) < 2) continue;
+      const a = (i - 1 + n) % n, b = (i + 1) % n;
+      const mx = (r[a * 2] + r[b * 2]) / 2 - r[i * 2], my = (r[a * 2 + 1] + r[b * 2 + 1]) / 2 - r[i * 2 + 1];
+      const l = Math.hypot(mx, my);
+      if (l > 1e-12) moved.push(i, (mx / l) * EPS, (my / l) * EPS);
+    }
+    for (let k = 0; k < moved.length; k += 3) {
+      r[moved[k] * 2] += moved[k + 1];
+      r[moved[k] * 2 + 1] += moved[k + 2];
+    }
+  }
+}
+
+/**
+ * Nudge every point by a tiny, position-derived amount (about 10 nm).
+ * Exactly collinear points on *different* rings (common along straight pixel
+ * edges) make earcut emit T-junctions, which leave the surface unclosed.
+ * Identical points get identical nudges, so shared points stay shared.
+ */
+function jitter(p: number[]): number[] {
+  const out = p.slice();
+  for (let i = 0; i < out.length; i += 2) {
+    const h = hash2(out[i], out[i + 1]);
+    out[i] += ((h & 0xffff) / 0xffff - 0.5) * 2e-5;
+    out[i + 1] += ((h >>> 16) / 0xffff - 0.5) * 2e-5;
+  }
+  return out;
+}
+
+function hash2(x: number, y: number): number {
+  let h = Math.imul(Math.round(x * 1e6) | 0, 0x9e3779b1) ^ Math.imul(Math.round(y * 1e6) | 0, 0x85ebca77);
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+  h = Math.imul(h ^ (h >>> 12), 0x297a2d39);
+  return (h ^ (h >>> 15)) >>> 0;
+}
+
+/**
+ * Merge vertices at identical positions and drop triangles that collapse.
+ * Earcut merges coincident points (e.g. where two holes touch at a pixel
+ * corner), so caps and walls may refer to different copies of the same point;
+ * welding makes them share edges again, giving a closed surface.
+ */
+export function weldMesh(mesh: Mesh): Mesh {
+  const index = new Map<string, number>();
+  const remap: number[] = [];
+  const positions: number[] = [];
+  const p = mesh.positions;
+  for (let i = 0; i < p.length; i += 3) {
+    const key = `${p[i]},${p[i + 1]},${p[i + 2]}`;
+    let j = index.get(key);
+    if (j === undefined) {
+      j = positions.length / 3;
+      index.set(key, j);
+      positions.push(p[i], p[i + 1], p[i + 2]);
+    }
+    remap.push(j);
+  }
+  const triangles: number[] = [];
+  const t = mesh.triangles;
+  for (let i = 0; i < t.length; i += 3) {
+    const a = remap[t[i]], b = remap[t[i + 1]], c = remap[t[i + 2]];
+    if (a !== b && b !== c && a !== c) triangles.push(a, b, c);
+  }
+  return { positions, triangles };
+}
+
+/**
  * Convert loops in image pixels (y down) to polygons in mm with y up, so the
  * model is not mirrored when viewed from above.
  */
@@ -176,9 +294,10 @@ export function loopsToPolygons(loops: Loop[], mmPerPx: number, imageHeightPx: n
       p[i] = p[i] * mmPerPx;
       p[i + 1] = (imageHeightPx - p[i + 1]) * mmPerPx;
     }
-    return p;
+    return removeCollinear(p);
   });
-  return groupPolygons(polys);
+  separatePinches(polys);
+  return groupPolygons(polys.map(jitter));
 }
 
 /** Signed volume of a closed mesh (positive when normals point outward). */

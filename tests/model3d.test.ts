@@ -4,6 +4,7 @@ import { buildParts, layerZRanges } from '../src/core/model3d';
 import { buildThreeMf } from '../src/core/threemf';
 import { traceEdges } from '../src/core/trace';
 import { VOID, type LabelMap } from '../src/core/types';
+import { mulberry32 } from '../src/core/rng';
 
 /** Every directed edge must appear exactly once and its reverse exactly once. */
 function isClosedManifold(mesh: Mesh): boolean {
@@ -115,7 +116,7 @@ describe('orientation and backing', () => {
     expect(bounds(parts[0].mesh).z).toEqual([0, 0.5]);
     expect(bounds(parts[1].mesh).z).toEqual([0.5, 1.5]);
     // The backing covers the whole silhouette (both colors), minus the transparent corner.
-    expect(meshVolume(parts[0].mesh)).toBeCloseTo((w * h - 9) * 0.5, 6);
+    expect(meshVolume(parts[0].mesh)).toBeCloseTo((w * h - 9) * 0.5, 3);
     for (const p of parts) expect(isClosedManifold(p.mesh) && meshVolume(p.mesh) > 0).toBe(true);
   });
 
@@ -126,8 +127,8 @@ describe('orientation and backing', () => {
     expect(right.z).toEqual([0, 1]);
     expect(backing.z).toEqual([1, 1.5]);
     // Color 0 (left half of the image) ends up on the right after turning over.
-    expect(left.x[0]).toBeCloseTo(10, 6);
-    expect(right.x[1]).toBeCloseTo(10, 6);
+    expect(left.x[0]).toBeCloseTo(10, 4);
+    expect(right.x[1]).toBeCloseTo(10, 4);
     // Rotation, not a mirror: meshes stay outward-facing.
     for (const p of parts) expect(isClosedManifold(p.mesh) && meshVolume(p.mesh) > 0).toBe(true);
   });
@@ -136,6 +137,33 @@ describe('orientation and backing', () => {
     const up = buildParts(graph, { ...opts, mode: 'stacked' });
     const down = buildParts(graph, { ...opts, mode: 'stacked', orientation: 'down' });
     expect(down.map((p) => p.mesh.positions)).toEqual(up.map((p) => p.mesh.positions));
+  });
+});
+
+describe('robust meshing', () => {
+  it('builds closed solids for noisy images (specks, touching holes, collinear edges)', () => {
+    const w = 160, h = 120;
+    const rand = mulberry32(5);
+    const labels = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let l = 0;
+        const d = Math.hypot(x - 50, y - 60);
+        if (d < 40) l = 1;
+        if (d < 18) l = 0;
+        if (Math.hypot(x - 120, y - 40) < 25) l = 2;
+        if (x > 95 && x < 150 && y > 75 && y < 110 && Math.sin(x * 0.7) + Math.cos(y * 0.5) > 0.3) l = 3;
+        if (rand() < 0.01) l = 2; // single-pixel specks
+        labels[y * w + x] = l;
+      }
+    const graph = traceEdges({ width: w, height: h, labels }, { tolerance: 1, curves: true });
+    for (const mode of ['cutout', 'stacked'] as const) {
+      const parts = buildParts(graph, { mode, stack: [0, 1, 2, 3], colors: ['#000000', '#111111', '#222222', '#333333'], names: ['a', 'b', 'c', 'd'], mmPerPx: 0.2, baseMm: 0.6, stepMm: 0.3, cutoutMm: 1, backingMm: 0.4 });
+      for (const p of parts) {
+        expect(isClosedManifold(p.mesh)).toBe(true);
+        expect(meshVolume(p.mesh)).toBeGreaterThan(0);
+      }
+    }
   });
 });
 

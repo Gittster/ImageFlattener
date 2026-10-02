@@ -1,3 +1,4 @@
+import { fitCubics } from './fitcurve';
 import { VOID, type LabelMap } from './types';
 
 /**
@@ -303,13 +304,17 @@ function simplifyRing(pts: number[], tol: number): number[] {
  * corner. The end points of open chains (shared junctions) never move.
  */
 export function sharpenCorners(
-  s: { pts: number[]; locked: boolean[] },
+  s: { pts: number[]; locked: boolean[]; i0?: number[]; i1?: number[] },
   closed: boolean,
   cornerCos: number,
   maxShort: number,
-): { pts: number[]; locked: boolean[] } {
+): { pts: number[]; locked: boolean[]; i0: number[]; i1: number[]; sharp: boolean[] } {
   const pts = s.pts.slice();
   const locked = Array.from({ length: pts.length / 2 }, (_, i) => !!s.locked[i]);
+  // Range of original (dense) point indices each vertex stands for.
+  const i0 = s.i0 ? s.i0.slice() : locked.map(() => -1);
+  const i1 = s.i1 ? s.i1.slice() : locked.map(() => -1);
+  const sharp = locked.map(() => false);
   const len = (i: number, j: number): number => Math.hypot(pts[j * 2] - pts[i * 2], pts[j * 2 + 1] - pts[i * 2 + 1]);
   let changed = true;
   while (changed) {
@@ -342,13 +347,18 @@ export function sharpenCorners(
       pts[a * 2] = x;
       pts[a * 2 + 1] = y;
       locked[a] = true;
+      sharp[a] = true;
+      i1[a] = i1[b];
       pts.splice(b * 2, 2);
       locked.splice(b, 1);
+      i0.splice(b, 1);
+      i1.splice(b, 1);
+      sharp.splice(b, 1);
       changed = true;
       break;
     }
   }
-  return { pts, locked };
+  return { pts, locked, i0, i1, sharp };
 }
 
 /**
@@ -363,58 +373,304 @@ function buildSegments(
   curves: boolean,
   cornerCos: number,
 ): Float64Array {
-  const simplified = sharpenCorners(
-    closed ? simplifyClosed(pts, locked, tol) : simplifyLocked(pts, locked, tol),
-    closed,
-    cornerCos,
-    2 + 4 * tol,
-  );
-  const p = simplified.pts;
-  const isLocked = simplified.locked;
+  const base = closed ? simplifyClosed(pts, locked, tol) : simplifyLocked(pts, locked, tol);
+  const idx = denseIndices(base.pts, pts, closed);
+  const v = sharpenCorners({ pts: base.pts, locked: base.locked, i0: idx, i1: idx.slice() }, closed, cornerCos, 2 + 4 * tol);
+  return curves ? fittedSegments(pts, closed, v, tol, cornerCos) : straightSegments(v.pts, closed);
+}
+
+/** Index in the dense point list of each simplified vertex (they are exact copies). */
+function denseIndices(simple: number[], dense: number[], closed: boolean): number[] {
+  const n = dense.length / 2;
+  const where = new Map<string, number[]>();
+  for (let i = 0; i < n; i++) {
+    const key = `${dense[i * 2]},${dense[i * 2 + 1]}`;
+    const list = where.get(key);
+    if (list) list.push(i);
+    else where.set(key, [i]);
+  }
+  const out: number[] = [];
+  let prev = -1;
+  for (let k = 0; k < simple.length / 2; k++) {
+    const list = where.get(`${simple[k * 2]},${simple[k * 2 + 1]}`) ?? [0];
+    // Vertices appear in walking order: take the next occurrence after the previous one.
+    let best = list[0];
+    if (prev >= 0) {
+      let bestD = Infinity;
+      for (const i of list) {
+        const d = closed ? (i - prev + n) % n : i - prev;
+        if (d > 0 && d < bestD) (bestD = d), (best = i);
+      }
+    }
+    out.push(best);
+    prev = best;
+  }
+  return out;
+}
+
+function straightSegments(p: number[], closed: boolean): Float64Array {
   const n = p.length / 2;
   const segCount = closed ? n : n - 1;
   const out = new Float64Array(2 + segCount * 6);
   out[0] = p[0];
   out[1] = p[1];
-  const X = (i: number): number => p[((i % n + n) % n) * 2];
-  const Y = (i: number): number => p[((i % n + n) % n) * 2 + 1];
-  // Unit tangent at vertex i (or null for a corner).
-  const tangents: ([number, number] | null)[] = [];
-  for (let i = 0; i < n; i++) {
-    if (!curves || isLocked[i] || (!closed && (i === 0 || i === n - 1))) {
-      tangents.push(null);
-      continue;
-    }
-    const ix = X(i) - X(i - 1), iy = Y(i) - Y(i - 1);
-    const ox = X(i + 1) - X(i), oy = Y(i + 1) - Y(i);
-    const il = Math.hypot(ix, iy), ol = Math.hypot(ox, oy);
-    if (il === 0 || ol === 0 || (ix * ox + iy * oy) / (il * ol) < cornerCos) {
-      tangents.push(null);
-      continue;
-    }
-    const tx = ix / il + ox / ol, ty = iy / il + oy / ol;
-    const tl = Math.hypot(tx, ty);
-    tangents.push(tl === 0 ? null : [tx / tl, ty / tl]);
-  }
-  // Handle length at a vertex is limited by the shorter of its two segments,
-  // so a smooth vertex next to a tiny segment can't bulge a long straight side.
-  const segLen = (i: number): number => Math.hypot(X(i + 1) - X(i), Y(i + 1) - Y(i));
   for (let s = 0; s < segCount; s++) {
-    const ax = X(s), ay = Y(s), bx = X(s + 1), by = Y(s + 1);
-    const len = segLen(s);
-    const ta = tangents[s];
-    const tb = tangents[(s + 1) % n];
-    const ha = ta ? Math.min(len, segLen(s - 1)) / 3 : 0;
-    const hb = tb ? Math.min(len, segLen(s + 1)) / 3 : 0;
+    const j = (s + 1) % n;
     const o = 2 + s * 6;
-    out[o] = ta ? ax + ta[0] * ha : ax;
-    out[o + 1] = ta ? ay + ta[1] * ha : ay;
-    out[o + 2] = tb ? bx - tb[0] * hb : bx;
-    out[o + 3] = tb ? by - tb[1] * hb : by;
-    out[o + 4] = bx;
-    out[o + 5] = by;
+    out[o] = p[s * 2];
+    out[o + 1] = p[s * 2 + 1];
+    out[o + 2] = out[o + 4] = p[j * 2];
+    out[o + 3] = out[o + 5] = p[j * 2 + 1];
   }
   return out;
+}
+
+/** Arc-length window (px) over which a corner's turning angle is measured. */
+const CORNER_WINDOW = 3;
+/** Binomial smoothing passes over the staircase points before fitting. */
+const SMOOTH_PASSES = 6;
+/** Minimum turn over that window for a polygon corner to be kept sharp. */
+const WINDOW_CORNER_COS = Math.cos((40 * Math.PI) / 180);
+
+/**
+ * Smooth curves through the dense boundary points. Corners come from the
+ * simplified/sharpened vertices, but a vertex only counts as a corner if the
+ * boundary really turns sharply over a few pixels on each side (so small round
+ * dots don't become polygons). Between corners, the staircase points are
+ * lightly smoothed and fitted with least-squares cubic Béziers.
+ */
+function fittedSegments(
+  dense: number[],
+  closed: boolean,
+  v: { pts: number[]; i0: number[]; i1: number[]; sharp: boolean[] },
+  tol: number,
+  cornerCos: number,
+): Float64Array {
+  const n = dense.length / 2;
+  const D: [number, number][] = Array.from({ length: n }, (_, i) => [dense[i * 2], dense[i * 2 + 1]]);
+  const m = v.pts.length / 2;
+  const at = (i: number): number => (closed ? ((i % n) + n) % n : Math.max(0, Math.min(n - 1, i)));
+  const step = closed ? (i: number, d: number): number => (i + d + n) % n : (i: number, d: number): number => i + d;
+
+  // A point about CORNER_WINDOW px away from dense index `from`, walking in direction `dir`.
+  const reach = (from: number, dir: 1 | -1): [number, number] => {
+    let i = from, dist = 0;
+    for (let k = 0; k < n; k++) {
+      const j = step(i, dir);
+      if (!closed && (j < 0 || j >= n)) break;
+      dist += Math.hypot(D[j][0] - D[i][0], D[j][1] - D[i][1]);
+      i = j;
+      if (dist >= CORNER_WINDOW) break;
+    }
+    return D[i];
+  };
+  const isCorner: boolean[] = [];
+  for (let k = 0; k < m; k++) {
+    if (!closed && (k === 0 || k === m - 1)) {
+      isCorner.push(true);
+      continue;
+    }
+    if (v.sharp[k]) {
+      // Rebuilt from two long edges meeting at a sharp angle.
+      isCorner.push(true);
+      continue;
+    }
+    // The simplified polygon turns sharply here; confirm the boundary itself
+    // turns by at least WINDOW_CORNER_DEG over a few pixels on each side.
+    const kp = (k - 1 + m) % m, kn = (k + 1) % m;
+    const sx = v.pts[k * 2] - v.pts[kp * 2], sy = v.pts[k * 2 + 1] - v.pts[kp * 2 + 1];
+    const tx = v.pts[kn * 2] - v.pts[k * 2], ty = v.pts[kn * 2 + 1] - v.pts[k * 2 + 1];
+    const ls = Math.hypot(sx, sy), lt = Math.hypot(tx, ty);
+    if (!(ls > 1e-9 && lt > 1e-9 && (sx * tx + sy * ty) / (ls * lt) < cornerCos)) {
+      isCorner.push(false);
+      continue;
+    }
+    const c: [number, number] = [v.pts[k * 2], v.pts[k * 2 + 1]];
+    const p = reach(v.i0[k], -1);
+    const q = reach(v.i1[k], 1);
+    const ax = c[0] - p[0], ay = c[1] - p[1], bx = q[0] - c[0], by = q[1] - c[1];
+    const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+    isCorner.push(la > 1e-9 && lb > 1e-9 && (ax * bx + ay * by) / (la * lb) < WINDOW_CORNER_COS);
+  }
+
+  // Light smoothing of the staircase, with corners (and open ends) pinned.
+  const pinned = new Uint8Array(n);
+  if (!closed) pinned[0] = pinned[n - 1] = 1;
+  for (let k = 0; k < m; k++) {
+    if (!isCorner[k]) continue;
+    for (let i = v.i0[k], guard = 0; guard <= n; i = step(i, 1), guard++) {
+      pinned[at(i)] = 1;
+      if (at(i) === at(v.i1[k])) break;
+    }
+  }
+  // Binomial smoothing of the staircase (corners pinned).
+  let S = D.map((p) => [p[0], p[1]] as [number, number]);
+  for (let pass = 0; pass < SMOOTH_PASSES; pass++) {
+    const next = S.map((p) => [p[0], p[1]] as [number, number]);
+    for (let i = 0; i < n; i++) {
+      if (pinned[i] || (!closed && (i === 0 || i === n - 1))) continue;
+      const a = S[at(i - 1)], b = S[at(i + 1)];
+      next[i] = [0.25 * a[0] + 0.5 * S[i][0] + 0.25 * b[0], 0.25 * a[1] + 0.5 * S[i][1] + 0.25 * b[1]];
+    }
+    S = next;
+  }
+
+  // Fit error in px. Loose enough not to follow anti-aliasing noise (edge
+  // pixels of real images jitter by ~0.5 px), tight enough to stay within
+  // ~0.35 px of clean analytic curves (see tests/vector.test.ts).
+  const err = Math.max(0.15, 0.35 * tol);
+  const segs: number[] = [];
+  const corners = [...Array(m).keys()].filter((k) => isCorner[k]);
+
+  if (corners.length === 0) {
+    // Closed curve without corners: fit two halves between opposite points,
+    // with the same (centered) tangent on both sides of each join.
+    const s0 = at(v.i0[0]);
+    const s1 = at(s0 + Math.floor(n / 2));
+    // Tangent from a least-squares line through the points within ~4 px.
+    const tangentAt = (i: number): [number, number] => {
+      const pts: [number, number][] = [S[i]];
+      for (const dir of [-1, 1]) {
+        let j = i, dist = 0;
+        for (let k = 0; k < n / 4 && dist < 4; k++) {
+          const nj = at(j + dir);
+          dist += Math.hypot(S[nj][0] - S[j][0], S[nj][1] - S[j][1]);
+          j = nj;
+          pts.push(S[j]);
+        }
+      }
+      const mx = pts.reduce((a, p) => a + p[0], 0) / pts.length, my = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+      let sxx = 0, sxy = 0, syy = 0;
+      for (const p of pts) {
+        sxx += (p[0] - mx) ** 2;
+        sxy += (p[0] - mx) * (p[1] - my);
+        syy += (p[1] - my) ** 2;
+      }
+      const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+      let t: [number, number] = [Math.cos(ang), Math.sin(ang)];
+      // Orient along the walking direction.
+      const fwd = S[at(i + 1)], back = S[at(i - 1)];
+      if (t[0] * (fwd[0] - back[0]) + t[1] * (fwd[1] - back[1]) < 0) t = [-t[0], -t[1]];
+      return t;
+    };
+    const t0 = tangentAt(s0), t1 = tangentAt(s1);
+    const half = (from: number, to: number, tf: [number, number], tt: [number, number]): void => {
+      const data: [number, number][] = [];
+      for (let i = from, guard = 0; guard <= n; i = at(i + 1), guard++) {
+        data.push(S[i]);
+        if (i === to) break;
+      }
+      if (data.length < 2) return;
+      fitCubics(data, tf, [-tt[0], -tt[1]], err, segs);
+    };
+    half(s0, s1, t0, t1);
+    half(s1, s0, t1, t0);
+    return Float64Array.from([S[s0][0], S[s0][1], ...segs]);
+  }
+
+  const spanCount = closed ? corners.length : corners.length - 1;
+  for (let c = 0; c < spanCount; c++) {
+    const ka = corners[c], kb = corners[(c + 1) % corners.length];
+    const A: [number, number] = [v.pts[ka * 2], v.pts[ka * 2 + 1]];
+    const B: [number, number] = [v.pts[kb * 2], v.pts[kb * 2 + 1]];
+    const data: [number, number][] = [A];
+    for (let i = step(v.i1[ka], 1), guard = 0; guard < n; i = step(i, 1), guard++) {
+      if (!closed && (i < 0 || i >= n)) break;
+      if (at(i) === at(v.i0[kb])) break;
+      data.push(S[at(i)]);
+    }
+    data.push(B);
+    // Points right next to a corner are the pixel-rounded tip, not the edge.
+    const clean = data.filter(
+      (p, k) => k === 0 || k === data.length - 1 || (Math.hypot(p[0] - A[0], p[1] - A[1]) > 1.25 && Math.hypot(p[0] - B[0], p[1] - B[1]) > 1.25),
+    );
+    fitSpan(clean, err, segs);
+  }
+  return Float64Array.from([v.pts[corners[0] * 2], v.pts[corners[0] * 2 + 1], ...segs]);
+}
+
+/**
+ * Spans within this distance (px) of their chord are drawn as straight lines.
+ * Covers the pixel staircase plus anti-aliasing noise of real straight edges.
+ */
+const STRAIGHT_PX = 0.85;
+/** ...as long as they don't bow away from it by more than this (px). */
+const STRAIGHT_SAG_PX = 0.2;
+
+/** Solve a 3x3 linear system (row-major) by Cramer's rule; zeros if singular. */
+function solve3(m: number[], r: number[]): [number, number, number] {
+  const det = (a: number[]): number =>
+    a[0] * (a[4] * a[8] - a[5] * a[7]) - a[1] * (a[3] * a[8] - a[5] * a[6]) + a[2] * (a[3] * a[7] - a[4] * a[6]);
+  const d = det(m);
+  if (Math.abs(d) < 1e-12) return [0, 0, 0];
+  const col = (k: number): number[] => m.map((v, i) => (i % 3 === k ? r[Math.floor(i / 3)] : v));
+  return [det(col(0)) / d, det(col(1)) / d, det(col(2)) / d];
+}
+
+const normalizeV = (a: [number, number]): [number, number] => {
+  const l = Math.hypot(a[0], a[1]);
+  return l > 1e-12 ? [a[0] / l, a[1] / l] : [0, 0];
+};
+
+/**
+ * Fit one span between two corners: a straight segment if it is straight, else
+ * cubics. `tA`/`tB` override the end tangents (pointing into the span).
+ */
+function fitSpan(data: [number, number][], err: number, out: number[], tA?: [number, number], tB?: [number, number]): void {
+  const A = data[0], B = data[data.length - 1];
+  const chord = Math.hypot(B[0] - A[0], B[1] - A[1]);
+  const straight = (): void => void out.push(A[0], A[1], B[0], B[1], B[0], B[1]);
+  if (data.length <= 2) return straight();
+  // A span whose ends (nearly) meet, e.g. a closed loop with a single corner,
+  // has no usable chord: split it at the point farthest from its ends, with a
+  // shared tangent there.
+  let far = 0, farD = 0;
+  for (let i = 1; i < data.length - 1; i++) {
+    const d = Math.min(Math.hypot(data[i][0] - A[0], data[i][1] - A[1]), Math.hypot(data[i][0] - B[0], data[i][1] - B[1]));
+    if (d > farD) [far, farD] = [i, d];
+  }
+  if (chord < 1e-9 || chord < 0.5 * farD) {
+    if (farD < 1e-9) return straight();
+    const r = Math.max(1, Math.min(4, far, data.length - 1 - far));
+    const t = normalizeV([data[far + r][0] - data[far - r][0], data[far + r][1] - data[far - r][1]]);
+    fitSpan(data.slice(0, far + 1), err, out, tA, [-t[0], -t[1]]);
+    fitSpan(data.slice(far), err, out, t, tB);
+    return;
+  }
+  // Straight if every point is within the error of the chord.
+  // Signed deviation d from the chord as a function of position s (0..1)
+  // along it, fitted with d ~ a + b*s + c*s*(1-s). The bow term c measures a
+  // real bulge (sagitta c/4); offset/tilt and pixel noise don't contribute.
+  let maxDev = 0;
+  const M = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  const R = [0, 0, 0];
+  for (let i = 1; i < data.length - 1; i++) {
+    const rx = data[i][0] - A[0], ry = data[i][1] - A[1];
+    const d = (rx * (B[1] - A[1]) - ry * (B[0] - A[0])) / chord;
+    const t = (rx * (B[0] - A[0]) + ry * (B[1] - A[1])) / (chord * chord);
+    if (Math.abs(d) > maxDev) maxDev = Math.abs(d);
+    const f = [1, t, t * (1 - t)];
+    for (let r = 0; r < 3; r++) {
+      R[r] += f[r] * d;
+      for (let c = 0; c < 3; c++) M[r * 3 + c] += f[r] * f[c];
+    }
+  }
+  const sag = Math.abs(solve3(M, R)[2]) / 4;
+  // Pixel staircases ripple by up to about half a pixel around a straight edge,
+  // so anything within that of the chord is a straight line.
+  // A noisy straight edge scatters around its chord (mean ~0); a curve bulges
+  // to one side, so it is only straightened if it is within the fit error.
+  if (maxDev <= err || (maxDev <= STRAIGHT_PX && sag <= STRAIGHT_SAG_PX)) return straight();
+  // End tangents from the data a few pixels into the span, past the pixel
+  // rounding right at the corner.
+  const reachLen = Math.min(5, chord * 0.3);
+  const dirFrom = (from: [number, number], pts: [number, number][]): [number, number] => {
+    for (const p of pts) if (Math.hypot(p[0] - from[0], p[1] - from[1]) >= reachLen) return normalizeV([p[0] - from[0], p[1] - from[1]]);
+    return normalizeV([pts[pts.length - 1][0] - from[0], pts[pts.length - 1][1] - from[1]]);
+  };
+  const t1 = tA ?? dirFrom(A, data.slice(1));
+  const t2 = tB ?? dirFrom(B, data.slice(0, -1).reverse());
+  fitCubics(data, t1, t2, err, out);
 }
 
 /** Reverse a segment chain (same curve, opposite direction). */
@@ -547,12 +803,60 @@ function chainToLoop(chain: Float64Array[]): Loop {
   };
 }
 
+/** Split cubics (de Casteljau, at t = 0.5) until none turns more than `maxTurnDeg`. */
+export function refineLoop(loop: Loop, maxTurnDeg: number): Loop {
+  const cosMax = Math.cos((maxTurnDeg * Math.PI) / 180);
+  const out = { px: [] as number[], py: [] as number[], c1x: [] as number[], c1y: [] as number[], c2x: [] as number[], c2y: [] as number[] };
+  const turnOk = (x0: number, y0: number, x1: number, y1: number, x2: number, y2: number, x3: number, y3: number): boolean => {
+    // Angle between the start and end tangents of the cubic.
+    let ax = x1 - x0, ay = y1 - y0;
+    if (Math.hypot(ax, ay) < 1e-9) (ax = x2 - x0), (ay = y2 - y0);
+    let bx = x3 - x2, by = y3 - y2;
+    if (Math.hypot(bx, by) < 1e-9) (bx = x3 - x1), (by = y3 - y1);
+    const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+    return la < 1e-9 || lb < 1e-9 || (ax * bx + ay * by) / (la * lb) >= cosMax;
+  };
+  const push = (c: number[], depth: number): void => {
+    const [x0, y0, x1, y1, x2, y2, x3, y3] = c;
+    if (depth >= 6 || turnOk(x0, y0, x1, y1, x2, y2, x3, y3)) {
+      out.px.push(x0);
+      out.py.push(y0);
+      out.c1x.push(x1);
+      out.c1y.push(y1);
+      out.c2x.push(x2);
+      out.c2y.push(y2);
+      return;
+    }
+    const mx01 = (x0 + x1) / 2, my01 = (y0 + y1) / 2, mx12 = (x1 + x2) / 2, my12 = (y1 + y2) / 2, mx23 = (x2 + x3) / 2, my23 = (y2 + y3) / 2;
+    const ax = (mx01 + mx12) / 2, ay = (my01 + my12) / 2, bx = (mx12 + mx23) / 2, by = (my12 + my23) / 2;
+    const mx = (ax + bx) / 2, my = (ay + by) / 2;
+    push([x0, y0, mx01, my01, ax, ay, mx, my], depth + 1);
+    push([mx, my, bx, by, mx23, my23, x3, y3], depth + 1);
+  };
+  const n = loop.px.length;
+  for (let i = 0; i < n; i++) {
+    const j = (i + 1) % n;
+    push([loop.px[i], loop.py[i], loop.c1x[i], loop.c1y[i], loop.c2x[i], loop.c2y[i], loop.px[j], loop.py[j]], 0);
+  }
+  return {
+    px: Float64Array.from(out.px),
+    py: Float64Array.from(out.py),
+    c1x: Float64Array.from(out.c1x),
+    c1y: Float64Array.from(out.c1y),
+    c2x: Float64Array.from(out.c2x),
+    c2y: Float64Array.from(out.c2y),
+  };
+}
+
 /**
  * Grow a loop outward (to the right of travel) by `d` pixels. Each anchor
  * moves along its miter normal and drags its adjacent control points along,
  * which approximates a true offset curve well for small distances.
  */
-export function offsetLoop(loop: Loop, d: number): Loop {
+export function offsetLoop(loopIn: Loop, d: number): Loop {
+  // Moving anchors and handles only approximates an offset curve well when
+  // each cubic bends gently, so split strongly bending cubics first.
+  const loop = d === 0 ? loopIn : refineLoop(loopIn, 30);
   const n = loop.px.length;
   const out: Loop = {
     px: loop.px.slice(),
@@ -621,13 +925,22 @@ export function loopsToPathData(loops: Loop[], scale: number, curves: boolean): 
   return parts.join('');
 }
 
-/** Signed area of a loop's control polygon approximation (shoelace on anchors). */
+/** Signed area enclosed by a loop, including its curves (flattened). */
 export function loopArea(loop: Loop): number {
   let a = 0;
   const n = loop.px.length;
+  const STEPS = 16;
   for (let i = 0; i < n; i++) {
     const j = (i + 1) % n;
-    a += loop.px[i] * loop.py[j] - loop.px[j] * loop.py[i];
+    let px = loop.px[i], py = loop.py[i];
+    for (let s = 1; s <= STEPS; s++) {
+      const t = s / STEPS, u = 1 - t;
+      const x = u * u * u * loop.px[i] + 3 * u * u * t * loop.c1x[i] + 3 * u * t * t * loop.c2x[i] + t * t * t * loop.px[j];
+      const y = u * u * u * loop.py[i] + 3 * u * u * t * loop.c1y[i] + 3 * u * t * t * loop.c2y[i] + t * t * t * loop.py[j];
+      a += px * y - x * py;
+      px = x;
+      py = y;
+    }
   }
   return a / 2;
 }

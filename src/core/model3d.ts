@@ -1,4 +1,4 @@
-import { emptyMesh, extrudePolygons, loopsToPolygons, type Mesh } from './mesh';
+import { emptyMesh, extrudePolygons, loopsToPolygons, weldMesh, type Mesh } from './mesh';
 import { buildLayerLoops, type ExportMode } from './svg';
 import type { ThreeMfPart } from './threemf';
 import { regionLoops, type EdgeGraph } from './trace';
@@ -110,5 +110,6 @@ export function buildParts(graph: EdgeGraph, opts: Model3dOptions): ThreeMfPart[
     const total = modelThickness(opts, opts.stack.length);
     for (const p of parts) turnOver(p.mesh, width, total);
   }
-  return parts;
+  // Weld duplicate vertices so every part is a closed, watertight surface.
+  return parts.map((p) => ({ ...p, mesh: weldMesh(p.mesh) }));
 }

@@ -34,15 +34,16 @@ The build uses `base: './'`, so `dist/` works from any folder or subpath. You ca
 ## How it works
 
 ```
-image ─► downscale (≤1500 px) ─► optional blur ─► k-means in CIELAB ─► palette merges
-      ─► mode filter ─► despeckle ─► trace shared boundary edges ─► simplify + Bézier fit
+image ─► downscale (≤1500 px) ─► optional blur ─► k-means in CIELAB ─► merge near-duplicates ─► palette merges
+      ─► mode filter ─► despeckle ─► trace shared boundary edges ─► corners + least-squares Bézier fit
       ─► assemble per-color shapes (stacked or cutout) ─► SVG / PNG / ZIP / JSON
 ```
 
 * All heavy work (clustering, cleanup, tracing, PNG encoding) runs in a **Web Worker**, so the UI stays responsive. Each stage is cached, so changing a later setting doesn't redo earlier stages.
 * **Tracing** is a topology-preserving approach written for this app, not Potrace:
   * Boundaries are traced along the pixel-edge grid and split into *edges* between junctions, the points where three or more regions meet.
-  * Each edge is simplified (Douglas-Peucker) and fitted with cubic Béziers **once**. Every region's outline is then assembled from those shared edges.
+  * Each edge is fitted **once**. Every region's outline is then assembled from those shared edges.
+  * **Curve fitting:** Douglas-Peucker finds candidate corners; a corner is kept only if the boundary really turns there (at least 40° over a few pixels). Between corners the pixel staircase is lightly smoothed, and cubic Béziers are fitted by least squares (Schneider's algorithm), splitting where needed until every point is within the fit error. On rasterized circles and ellipses the result stays within about 0.35 px of the true edge (RMS under 0.2 px). Runs that are straight within the pixel noise become exact straight lines.
   * Neighbouring colors therefore agree exactly on their common border. Cutout shapes tile with no slivers or gaps, and stacked unions reuse the same geometry.
   * Tracing each color independently (as per-color Potrace does) can't guarantee this.
 * **Corner reconstruction:** pixelation and simplification turn a sharp corner into a short flat or notch between two long edges. When the two long edges meet at a sharp angle (more than 60°), the short piece is replaced by the point where their lines cross. That keeps star points and inner corners crisp. Curves are left alone, because their segments are all similar lengths.
@@ -60,7 +61,7 @@ The app remembers which sections you leave open.
 ### Colors
 | Setting | What it does |
 |---|---|
-| **Number of colors** (2–12) | Target palette size (*k* in k-means). If the image has fewer distinct colors, it uses that many and tells you. |
+| **Number of colors** (2–12) | Target palette size (*k* in k-means). If the image has fewer distinct colors, it uses that many and tells you. Clusters the eye can't tell apart (CIEDE2000 < 2), typically anti-aliasing shades of one flat color, are merged automatically. |
 | **Pre-blur** (0–3 px) | Gaussian blur before clustering. Reduces noise and grain in photos, giving cleaner regions. Use 0 for flat artwork. |
 | **Re-cluster (new seed)** | k-means++ uses a fixed seed, so results are reproducible. This picks a new seed for a different clustering. It also resets merges and overrides. |
 
@@ -95,7 +96,7 @@ The panel also shows the resulting mm-per-pixel resolution. It warns when a pixe
 ### Vector
 | Setting | What it does |
 |---|---|
-| **Simplification tolerance** (px) | Douglas-Peucker tolerance. Higher values give fewer nodes and smoother but less exact outlines. |
+| **Simplification tolerance** (px) | How loosely outlines may follow the pixels. Polylines use it as the Douglas-Peucker tolerance; curves are fitted to within 0.35 × this value (at least 0.15 px). Higher values give fewer nodes and smoother but less exact outlines. |
 | **Smooth curves** | Fit cubic Béziers (default) or keep straight polylines. Sharp corners are kept either way. |
 
 ### Export
@@ -123,7 +124,7 @@ The panel also shows the resulting mm-per-pixel resolution. It warns when a pixe
 * Left pane: the original image. Right pane: the result, as **Raster** (label map) or **Vector** (the actual SVG).
 * Scroll to zoom and drag to pan. The two panes stay in sync. Double-click or **Fit** resets the view.
 * Transparent areas show a checkerboard.
-* Load images with **Open image…**, drag and drop, or paste (Ctrl/Cmd+V). The **Load sample** menu has a flat logo, a photo, and an image with transparency.
+* Load images with **Open image…**, drag and drop, or paste (Ctrl/Cmd+V). PNG, JPEG, WebP, GIF, BMP and AVIF work, and so does SVG: it is rasterized at 3000 px on its long edge (size taken from its `viewBox` or `width`/`height`). The **Load sample** menu has a flat logo, a photo, and an image with transparency.
 
 ### Brush (touch-ups)
 The toolbar floating on the preview has three tools:
@@ -242,7 +243,8 @@ src/
     blur.ts        alpha-aware Gaussian pre-blur
     palette.ts     merges, overrides, black/white pinning
     cleanup.ts     mode filter, despeckle, connected components, EDT, thin features
-    trace.ts       shared-edge tracing, simplification, Bézier fitting, loop assembly, bleed
+    trace.ts       shared-edge tracing, corner detection, curve fitting, loop assembly, bleed
+    fitcurve.ts    least-squares cubic Bézier fitting (Schneider)
     svg.ts         stacked/cutout layer sets and SVG document writer
     mesh.ts        Bézier flattening, hole grouping, earcut triangulation, extrusion
     model3d.ts     height bands and one extruded part per color
