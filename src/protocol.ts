@@ -37,6 +37,13 @@ export interface VectorParams {
   scale: number;
 }
 
+export interface EditParams {
+  /** Version of the edit layer last sent with an 'edits' message (0 = none). */
+  version: number;
+  /** Palette entry id -> current entry index (-1 if gone), length 255. */
+  idToIndex: number[];
+}
+
 export interface PipelineParams {
   /** Image the request was made for; results for older images are discarded. */
   imageVersion: number;
@@ -45,6 +52,7 @@ export interface PipelineParams {
   cleanup: CleanupParams;
   /** Omitted when no vector output is needed. */
   vector?: VectorParams;
+  edits: EditParams;
 }
 
 export interface VectorResult {
@@ -68,8 +76,10 @@ export interface PipelineResult {
   quant: QuantizeInfo;
   /** Number of palette entries the labels refer to. */
   entryCount: number;
-  /** Final label map (after palette merges and cleanup). */
+  /** Final label map (after palette merges, cleanup and brush edits). */
   labels: Uint8Array;
+  /** Labels before brush edits (only when edits were applied; empty otherwise). */
+  baseLabels: Uint8Array;
   /** Pixel count per palette entry in the final label map. */
   counts: number[];
   /** Identifies the cleaned label map (thin-feature results refer to it). */
@@ -84,6 +94,7 @@ export interface PipelineResult {
 export type WorkerRequest =
   | { type: 'image'; version: number; width: number; height: number; data: Uint8ClampedArray }
   | { type: 'process'; id: number; params: PipelineParams }
+  | { type: 'edits'; version: number; width: number; height: number; data: Uint8Array }
   | { type: 'png'; id: number; width: number; height: number; colors: (RGB | null)[] }
   | { type: '3mf'; id: number; cleanKey: string; options: Model3dOptions; objectName: string };
 

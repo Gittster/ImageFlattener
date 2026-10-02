@@ -5,6 +5,11 @@ import type { ExportMode, SvgLayer } from './core/svg';
 import { layerId, svgDocument } from './core/svg';
 import { baseName, downloadBlob, svgBlob, zipBlob } from './exporters';
 import { EXPORT_MAX } from './imageLoader';
+import { deltaE2000 } from './core/color';
+import { EDIT_NONE, EDIT_VOID, editValueForEntry, hasEdits, remapEdits, resampleEdits } from './core/edits';
+import { hexLab } from './core/filaments';
+import { PaintController, type Tool } from './paint';
+import { buildProject, isProjectFile, PROJECT_EXTENSION, readProject, type ProjectDoc } from './project';
 import { assignFilaments, filamentDistance } from './core/filaments';
 import { filamentLabel, getMyFilaments, myFilamentCount, openFilamentPicker } from './filamentPicker';
 
@@ -25,7 +30,7 @@ app.innerHTML = `
 <header class="top">
   <h1>Image Flattener</h1>
   <button id="open-btn" class="primary">Open image…</button>
-  <input id="file-input" type="file" accept="image/*" hidden />
+  <input id="file-input" type="file" accept="image/*,.ifproj" hidden />
   <select id="sample-select" aria-label="Load sample">
     <option value="">Load sample…</option>
     ${SAMPLES.map((s) => `<option value="${s.id}">${s.label}</option>`).join('')}
@@ -33,11 +38,15 @@ app.innerHTML = `
   <span class="hint">or drop / paste an image</span>
   <span class="spacer"></span>
   <span id="image-info" class="hint"></span>
+  <button id="open-project-btn" title="Open a saved .ifproj project">Open project…</button>
+  <input id="project-input" type="file" accept=".ifproj,application/zip" hidden />
+  <button id="save-project-btn" disabled title="Save image, settings, palette, filaments and brush edits to a .ifproj file">Save project</button>
 </header>
 <div class="layout">
   <aside class="controls">
-    <section>
-      <h2>Colors</h2>
+    <div class="controls-scroll">
+    <details class="sec" data-sec="colors" open>
+      <summary><span>Colors</span><span class="sum" id="sum-colors"></span></summary>
       <div class="field">
         <label for="colors">Number of colors <output id="colors-out"></output></label>
         <input id="colors" type="range" min="2" max="12" step="1" value="4" />
@@ -50,23 +59,42 @@ app.innerHTML = `
         <button id="reseed-btn" title="Re-run clustering with a new random seed">Re-cluster (new seed)</button>
         <span class="hint">seed <span id="seed-out"></span></span>
       </div>
-    </section>
-    <section>
-      <h2>Palette</h2>
+    </details>
+    <details class="sec" data-sec="palette" open>
+      <summary><span>Palette &amp; filaments</span><span class="sum" id="sum-palette"></span></summary>
       <div id="palette" class="palette"></div>
-      <div class="row">
+      <div class="btn-grid">
         <button id="merge-btn" disabled title="Merge the checked colors into one">Merge selected</button>
-        <button id="reset-palette-btn" title="Undo merges, color overrides and filament choices">Reset</button>
-      </div>
-      <div class="row" style="margin-top:6px">
-        <button id="match-mine-btn" title="Give every color the closest filament from your own list (each filament used once when possible)">Match to my filaments</button>
+        <button id="reset-palette-btn" title="Undo merges, color overrides and filament choices">Reset palette</button>
+        <button id="match-mine-btn" title="Give every color the closest filament from your own list (each filament used once when possible)">Match my filaments</button>
         <button id="my-filaments-btn" title="Choose the filaments you own">My filaments…</button>
       </div>
-      <label class="check" style="margin-top:8px"><input id="force-bw" type="checkbox" /> Force darkest/lightest to pure black/white</label>
-      <div class="hint">Click a swatch to override its output color, or the spool button to pick a real filament. Either only changes the output color, not which pixels belong to it.</div>
-    </section>
-    <section>
-      <h2>Cleanup</h2>
+      <label class="check" style="margin-top:8px"><input id="force-bw" type="checkbox" /> Pin darkest/lightest to black/white</label>
+      <div class="hint">Swatch: override the color · spool: pick a real filament. Neither changes which pixels belong to a color.</div>
+    </details>
+    <details class="sec" data-sec="layers" open>
+      <summary><span>Layers</span><span class="sum" id="sum-layers"></span></summary>
+      <div class="field">
+        <div class="seg seg-wide" id="mode-seg">
+          <button data-mode="stacked" class="on" title="Each layer continues under the layers above it (HueForge-style height bands in 3D)">Stacked</button>
+          <button data-mode="cutout" title="Non-overlapping shapes that tile the image">Cutout</button>
+        </div>
+      </div>
+      <div class="field" id="bleed-field" hidden>
+        <label for="bleed">SVG bleed / overlap <output id="bleed-out"></output></label>
+        <input id="bleed" type="range" min="0" max="0.2" step="0.01" value="0" />
+      </div>
+      <div class="field">
+        <div class="label"><span>Stack order</span><span class="value">top ↑</span></div>
+        <ol id="stack" class="stack"></ol>
+        <div class="row space-between">
+          <span class="hint">Drag or use the arrows. Bottom of the list = bottom of the print.</span>
+          <button id="sort-stack" class="mini-text" title="Darkest color at the bottom, lightest on top (typical for HueForge-style prints)">Sort dark → light</button>
+        </div>
+      </div>
+    </details>
+    <details class="sec" data-sec="cleanup">
+      <summary><span>Cleanup</span><span class="sum" id="sum-cleanup"></span></summary>
       <div class="field">
         <label for="mode">Smooth edges (mode filter) <output id="mode-out"></output></label>
         <input id="mode" type="range" min="0" max="3" step="1" value="1" />
@@ -81,9 +109,9 @@ app.innerHTML = `
       </div>
       <div id="thin-warning" class="status"></div>
       <label class="check"><input id="show-thin" type="checkbox" /> Highlight thin features</label>
-    </section>
-    <section>
-      <h2>Print size</h2>
+    </details>
+    <details class="sec" data-sec="print">
+      <summary><span>Print size</span><span class="sum" id="sum-print"></span></summary>
       <div class="field">
         <div class="label"><span>Print width</span><span class="value" id="print-height"></span></div>
         <div class="row"><input id="print-width" type="number" min="1" max="2000" step="1" value="100" aria-label="Print width in mm" /> mm</div>
@@ -97,38 +125,11 @@ app.innerHTML = `
         <div class="row"><input id="feature-mult" type="number" min="0.5" max="5" step="0.1" value="1.5" aria-label="Minimum feature size multiplier" /> × nozzle</div>
       </div>
       <div class="hint" id="resolution-info"></div>
-    </section>
-    <section>
-      <h2>Vector</h2>
+    </details>
+    <details class="sec" data-sec="model">
+      <summary><span>3D model (3MF)</span><span class="sum" id="sum-model"></span></summary>
       <div class="field">
-        <label for="tolerance">Simplification tolerance <output id="tolerance-out"></output></label>
-        <input id="tolerance" type="range" min="0.25" max="4" step="0.25" value="1" />
-      </div>
-      <label class="check"><input id="curves" type="checkbox" checked /> Smooth curves (Bézier)</label>
-    </section>
-    <section>
-      <h2>Export</h2>
-      <div class="field">
-        <div class="label"><span>Mode</span></div>
-        <div class="seg" id="mode-seg">
-          <button data-mode="stacked" class="on" title="Each layer continues under the layers above it">Stacked</button>
-          <button data-mode="cutout" title="Non-overlapping shapes that tile the image">Cutout</button>
-        </div>
-      </div>
-      <div class="field" id="bleed-field" hidden>
-        <label for="bleed">Bleed / overlap <output id="bleed-out"></output></label>
-        <input id="bleed" type="range" min="0" max="0.2" step="0.01" value="0" />
-      </div>
-      <div class="field">
-        <div class="label"><span>Stack order</span><span class="value">top ↑</span></div>
-        <ol id="stack" class="stack"></ol>
-        <div class="row space-between">
-          <span class="hint">Drag to reorder (or use the arrows). Bottom of the list = bottom of the print.</span>
-          <button id="sort-stack" class="mini-text" title="Darkest color at the bottom, lightest on top (typical for HueForge-style prints)">Sort dark → light</button>
-        </div>
-      </div>
-      <div class="field">
-        <div class="label"><span>3D model heights</span><span class="value" id="heights-total"></span></div>
+        <div class="label"><span>Heights</span><span class="value" id="heights-total"></span></div>
         <div class="row" id="heights-stacked">
           <label class="inline">Base <input id="base-mm" type="number" min="0.08" max="20" step="0.04" value="0.64" aria-label="Base layer thickness in mm" /> mm</label>
           <label class="inline">+ each color <input id="step-mm" type="number" min="0.04" max="20" step="0.04" value="0.32" aria-label="Thickness added per color in mm" /> mm</label>
@@ -139,7 +140,6 @@ app.innerHTML = `
         <div class="hint" id="heights-hint"></div>
       </div>
       <div class="field">
-        <div class="label"><span>3D model options</span></div>
         <div class="row" style="margin-bottom:6px">
           <span>Image face</span>
           <div class="seg" id="orient-seg">
@@ -155,22 +155,31 @@ app.innerHTML = `
         </div>
         <div class="hint" id="orient-hint"></div>
       </div>
-      <div class="row" style="margin-bottom:10px">
+    </details>
+    <details class="sec" data-sec="vector">
+      <summary><span>Vector &amp; SVG</span><span class="sum" id="sum-vector"></span></summary>
+      <div class="field">
+        <label for="tolerance">Simplification tolerance <output id="tolerance-out"></output></label>
+        <input id="tolerance" type="range" min="0.25" max="4" step="0.25" value="1" />
+      </div>
+      <label class="check"><input id="curves" type="checkbox" checked /> Smooth curves (Bézier)</label>
+      <div class="row">
         <label class="check" style="margin:0" title="Adds a filled rectangle behind the shapes in SVG exports only (not a 3D backing)"><input id="bg" type="checkbox" /> SVG background rect</label>
         <input id="bg-color" type="color" value="#ffffff" aria-label="Background color" disabled />
       </div>
-      <button id="export-3mf" class="primary wide" disabled title="3MF project for Bambu Studio: one part per color, colors pre-assigned">Bambu Studio 3MF (colors assigned)</button>
+    </details>
+    </div>
+    <div class="controls-foot">
+      <div id="status" class="status"></div>
+      <button id="export-3mf" class="primary wide" disabled title="3MF project for Bambu Studio: one part per color, colors pre-assigned">Bambu Studio 3MF</button>
       <div class="export-buttons">
         <button id="export-svg" disabled>Layered SVG</button>
-        <button id="export-zip" disabled>Per-color SVGs (.zip)</button>
+        <button id="export-zip" disabled>Per-color SVGs</button>
         <button id="export-png" disabled>Flattened PNG</button>
-        <button id="export-json" disabled>Settings (.json)</button>
+        <button id="export-json" disabled>Settings JSON</button>
       </div>
       <div id="export-info" class="hint"></div>
-    </section>
-    <section>
-      <div id="status" class="status"></div>
-    </section>
+    </div>
   </aside>
   <main class="panes">
     <div class="pane">
@@ -197,6 +206,20 @@ app.innerHTML = `
           <canvas id="raster-canvas"></canvas>
           <img id="vector-img" alt="Vector preview" draggable="false" hidden />
           <canvas id="thin-canvas" hidden></canvas>
+        </div>
+        <div class="paint-bar" id="paint-bar">
+          <div class="seg" id="tool-seg">
+            <button data-tool="pan" class="on" title="Pan / zoom (H). Hold Space to pan while painting.">✋</button>
+            <button data-tool="brush" title="Paint with the selected color (B)">🖌</button>
+            <button data-tool="eraser" title="Erase your edits (E)">⌫</button>
+          </div>
+          <div class="brush-colors" id="brush-colors" hidden></div>
+          <label class="brush-size" id="brush-size-wrap" hidden title="Brush size ([ and ] to change)">
+            <input id="brush-size" type="range" min="1" max="80" step="1" value="8" aria-label="Brush size" />
+            <output id="brush-size-out"></output>
+          </label>
+          <button id="undo-btn" title="Undo (Ctrl+Z)" disabled>↶</button>
+          <button id="clear-edits-btn" title="Remove all brush edits" disabled>Clear</button>
         </div>
         <div class="busy" id="busy"><span class="spinner"></span><span id="busy-text">Working…</span></div>
       </div>
@@ -334,15 +357,116 @@ client.onError = (message) => setStatus(message, 'error');
 client.onResult = (result) => {
   if (result.imageVersion !== state.imageVersion || state.loading) return; // stale
   state.result = result;
+  let rerun = false;
   if (result.quant.key !== state.quantKey) {
-    // New clustering: palette edits from the previous one no longer apply.
+    const oldEntries = state.entries;
+    const oldHex = paletteHex();
     state.quantKey = result.quant.key;
-    state.entries = entriesFromClusters(result.quant.centroids);
     state.selected.clear();
-    syncStack();
+    const restore = pendingRestore;
+    pendingRestore = null;
+    if (restore) rerun = applyRestore(restore, result);
+    else {
+      // New clustering: palette edits from the previous one no longer apply.
+      state.entries = entriesFromClusters(result.quant.centroids);
+      syncStack();
+      // Keep brush edits: map each old color to the closest new one.
+      if (paint.edits && oldEntries.length && hasEdits(paint.edits)) {
+        const map = new Map<number, number | null>();
+        oldEntries.forEach((e, k) => {
+          let best = -1, bestD = Infinity;
+          state.entries.forEach((n, j) => {
+            const d = deltaE2000(hexLab(oldHex[k]), hexLab(rgbToHex(n.base)));
+            if (d < bestD) (bestD = d), (best = j);
+          });
+          map.set(e.id, best >= 0 ? state.entries[best].id : null);
+        });
+        remapEdits(paint.edits, map);
+        paint.setEdits(paint.edits);
+        rerun = true;
+        setStatus('Brush edits were moved to the closest colors of the new palette.');
+      }
+    }
   }
   renderResult();
+  updatePaintButtons();
+  if (rerun) schedule(0);
 };
+
+// ------------------------------------------------------------- project ----
+interface Restore {
+  palette: ProjectDoc['palette'];
+  edits: { data: Uint8Array; width: number; height: number } | null;
+}
+let pendingRestore: Restore | null = null;
+
+/** Apply saved palette edits/brush edits once the restored image has been clustered. */
+function applyRestore(r: Restore, result: PipelineResult): boolean {
+  const p = r.palette;
+  if (p && p.clusterCount === result.quant.centroids.length) {
+    state.entries = p.entries.map((e) => ({ ...e, filament: e.filament ?? null }));
+    state.stackIds = p.stackIds.slice();
+  } else {
+    state.entries = entriesFromClusters(result.quant.centroids);
+    if (p) setStatus('The image clustered differently than when saved; palette edits were not restored.', 'warn');
+  }
+  syncStack();
+  if (r.edits) {
+    const { width: w, height: h } = result;
+    const data = r.edits.width === w && r.edits.height === h ? r.edits.data : resampleEdits(r.edits.data, r.edits.width, r.edits.height, w, h);
+    paint.setEdits(data);
+  }
+  return true;
+}
+
+const SETTINGS_KEYS = [
+  'colors', 'blur', 'seed', 'forceBW', 'modeFilter', 'despeckle', 'despeckleAuto', 'despeckleMm', 'printWidthMm',
+  'nozzleMm', 'featureMult', 'showThin', 'tolerance', 'curves', 'mode', 'bleedMm', 'background', 'backgroundColor',
+  'baseMm', 'stepMm', 'cutoutMm', 'orientation', 'backing', 'backingMm', 'backingChoice', 'backingCustom', 'view',
+] as const;
+
+async function saveProject(): Promise<void> {
+  const img = state.image;
+  const r = state.result;
+  if (!img) return;
+  const settings: Record<string, unknown> = {};
+  for (const k of SETTINGS_KEYS) settings[k] = state[k];
+  const blob = await buildProject(
+    {
+      image: { name: img.name, workingWidth: img.working.width, workingHeight: img.working.height },
+      settings,
+      palette: r
+        ? {
+            clusterCount: r.quant.centroids.length,
+            entries: state.entries.map((e) => ({ id: e.id, clusters: e.clusters, base: e.base, override: e.override, filament: e.filament ?? null })),
+            stackIds: state.stackIds,
+          }
+        : null,
+    },
+    img.blob,
+    paint.edits && hasEdits(paint.edits) ? { data: paint.edits, width: img.working.width, height: img.working.height } : null,
+  );
+  downloadBlob(blob, `${baseName(img.name)}${PROJECT_EXTENSION}`);
+}
+
+async function loadProjectFile(file: Blob): Promise<void> {
+  try {
+    const p = await readProject(file);
+    const st = state as unknown as Record<string, unknown>;
+    for (const k of SETTINGS_KEYS) {
+      const v = p.doc.settings[k];
+      if (v !== undefined && typeof v === typeof st[k]) st[k] = v;
+    }
+    syncControls();
+    await openBlob(p.image, p.doc.image.name, {
+      palette: p.doc.palette,
+      edits: p.edits && p.doc.edits ? { data: p.edits, width: p.doc.edits.width, height: p.doc.edits.height } : null,
+    });
+    setStatus(`Opened project "${p.doc.image.name}".`);
+  } catch (err) {
+    setStatus(err instanceof Error ? err.message : String(err), 'error');
+  }
+}
 
 client.onThin = (cleanKey, count, mask) => {
   const r = state.result;
@@ -365,6 +489,7 @@ function buildParams(): PipelineParams {
   const d = derived();
   return {
     imageVersion: state.imageVersion,
+    edits: { version: paint.edits ? paint.version : 0, idToIndex: idToIndex() },
     cleanup: { modeFilter: state.modeFilter, despeckleArea: d.despeckleArea, minFeaturePx: d.minFeaturePx },
     quantize: { colors: state.colors, blur: state.blur, seed: state.seed },
     palette: { quantKey: state.quantKey, groups: clusterGroups(state.entries, state.result?.quant.centroids.length ?? 0) },
@@ -383,7 +508,26 @@ function runPipeline(): void {
   runQueued = false;
   updateBusy();
   if (!state.image || state.loading) return;
+  syncEditsToWorker();
   client.process(buildParams());
+}
+
+let sentEditsVersion = -1;
+function syncEditsToWorker(): void {
+  const img = state.image;
+  if (!img || !paint.edits || sentEditsVersion === paint.version) return;
+  if (paint.edits.length !== img.working.width * img.working.height) return;
+  client.setEdits(paint.version, img.working.width, img.working.height, paint.edits.slice());
+  sentEditsVersion = paint.version;
+}
+
+/** Palette entry id -> current index. */
+function idToIndex(): number[] {
+  const out = new Array<number>(255).fill(-1);
+  state.entries.forEach((e, i) => {
+    if (e.id < 255) out[e.id] = i;
+  });
+  return out;
 }
 
 // ------------------------------------------------------------ viewport ----
@@ -393,6 +537,110 @@ viewports.add($('view-preview'), $('content-preview'));
 $('zoom-in').addEventListener('click', () => viewports.zoomBy(1.25));
 $('zoom-out').addEventListener('click', () => viewports.zoomBy(0.8));
 $('zoom-fit').addEventListener('click', () => viewports.fit());
+
+// --------------------------------------------------------------- brush ----
+const paint = new PaintController(
+  $('view-preview'),
+  $('content-preview'),
+  $<HTMLCanvasElement>('raster-canvas'),
+  () => viewports.getScale(),
+  {
+    size: () => (state.result && resultInSync() && !state.loading ? { width: state.result.width, height: state.result.height } : null),
+    pixelColor: (i, v) => pixelColor(i, v),
+    onChange: () => {
+      updatePaintButtons();
+      schedule(120);
+    },
+    onBeforePaint: () => {
+      if (state.view !== 'raster') setView('raster');
+    },
+  },
+);
+viewports.canPan = (_e, container) => container !== $('view-preview') || paint.wantsPan();
+
+function pixelColor(i: number, v: number): [number, number, number, number] {
+  if (v === EDIT_VOID) return [0, 0, 0, 0];
+  const r = state.result;
+  let idx: number;
+  if (v !== EDIT_NONE) idx = state.entries.findIndex((e) => e.id === v - 1);
+  else if (r) idx = (r.baseLabels.length ? r.baseLabels : r.labels)[i];
+  else idx = -1;
+  const c = idx >= 0 && idx !== VOID ? paletteColors()[idx] : undefined;
+  return c ? [c[0], c[1], c[2], 255] : [0, 0, 0, 0];
+}
+
+function setTool(t: Tool): void {
+  paint.tool = t;
+  $('tool-seg').querySelectorAll<HTMLButtonElement>('button').forEach((b) => b.classList.toggle('on', b.dataset.tool === t));
+  $('brush-colors').hidden = t !== 'brush';
+  $('brush-size-wrap').hidden = t === 'pan';
+  $('view-preview').classList.toggle('painting', t !== 'pan');
+  if (t !== 'pan' && state.view !== 'raster') setView('raster');
+}
+
+function updatePaintButtons(): void {
+  $<HTMLButtonElement>('undo-btn').disabled = !paint.canUndo();
+  $<HTMLButtonElement>('clear-edits-btn').disabled = !hasEdits(paint.edits);
+}
+
+function renderBrushColors(): void {
+  const el = $('brush-colors');
+  const hex = paletteHex();
+  const values = state.entries.map((e) => editValueForEntry(e.id));
+  if (!values.includes(paint.value) && paint.value !== EDIT_VOID) paint.value = values[0] ?? EDIT_VOID;
+  el.innerHTML =
+    state.entries
+      .map((e, i) => {
+        const label = e.filament ? `${e.filament.name} · ${e.filament.brand}` : hex[i];
+        return `<button class="bchip ${paint.value === values[i] ? 'on' : ''}" data-v="${values[i]}" title="${escAttr(label)}" style="background:${hex[i]}"></button>`;
+      })
+      .join('') +
+    `<button class="bchip transparent ${paint.value === EDIT_VOID ? 'on' : ''}" data-v="${EDIT_VOID}" title="Transparent (cut away)"></button>`;
+  el.querySelectorAll<HTMLButtonElement>('.bchip').forEach((b) =>
+    b.addEventListener('click', () => {
+      paint.value = Number(b.dataset.v);
+      renderBrushColors();
+    }),
+  );
+}
+
+function renderBrushSize(): void {
+  const d = paint.diameter;
+  $('brush-size-out').textContent = `${d}px` + (state.image ? ` · ${(d / derived().pxPerMm).toFixed(1)}mm` : '');
+}
+
+for (const b of $('tool-seg').querySelectorAll<HTMLButtonElement>('button')) b.addEventListener('click', () => setTool(b.dataset.tool as Tool));
+$<HTMLInputElement>('brush-size').addEventListener('input', (e) => {
+  paint.diameter = Number((e.target as HTMLInputElement).value);
+  renderBrushSize();
+});
+$('undo-btn').addEventListener('click', () => paint.undo());
+$('clear-edits-btn').addEventListener('click', () => {
+  if (confirm('Remove all brush edits? (You can undo this.)')) paint.clear();
+});
+// Keep toolbar clicks from starting a pan or a stroke.
+$('paint-bar').addEventListener('pointerdown', (e) => e.stopPropagation());
+window.addEventListener('keydown', (e) => {
+  const t = e.target as HTMLElement;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+    if (paint.canUndo()) {
+      e.preventDefault();
+      paint.undo();
+    }
+    return;
+  }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'b') setTool('brush');
+  else if (k === 'e') setTool('eraser');
+  else if (k === 'h' || k === 'escape') setTool('pan');
+  else if (k === '[' || k === ']') {
+    paint.diameter = Math.max(1, Math.min(80, paint.diameter + (k === ']' ? 2 : -2)));
+    $<HTMLInputElement>('brush-size').value = String(paint.diameter);
+    renderBrushSize();
+  }
+});
 
 // ------------------------------------------------------------- render -----
 function paletteHex(): string[] {
@@ -415,6 +663,8 @@ function renderResult(): void {
   renderRaster(r);
   renderThin(r);
   renderPalette();
+  renderBrushColors();
+  renderBrushSize();
   renderStack();
   renderVector();
   updateExportButtons();
@@ -537,10 +787,33 @@ function renderVector(): void {
 }
 
 // --------------------------------------------------------------- export ---
+/** One-line summaries shown on collapsed sidebar sections. */
+function renderSummaries(): void {
+  const r = resultInSync() ? state.result : null;
+  const d = derived();
+  const k = r ? exportedStack().length : 0;
+  $('sum-colors').textContent = r ? `${k} color${k === 1 ? '' : 's'}${state.blur ? ` · blur ${state.blur}` : ''}` : '';
+  const fil = state.entries.filter((e) => e.filament).length;
+  $('sum-palette').textContent = fil ? `${fil} filament${fil === 1 ? '' : 's'}` : '';
+  $('sum-layers').textContent = state.mode === 'stacked' ? 'Stacked' : 'Cutout';
+  const thin = r?.thinCount ?? -1;
+  const sumCleanup = $('sum-cleanup');
+  sumCleanup.textContent = thin > 0 ? `⚠ ${thin} thin` : [state.modeFilter ? `smooth ${state.modeFilter}` : '', state.despeckle ? 'despeckle' : ''].filter(Boolean).join(' · ');
+  sumCleanup.classList.toggle('warn', thin > 0);
+  $('sum-print').textContent = state.image ? `${fmtMm(state.printWidthMm)} × ${fmtMm(d.heightMm)} mm · ${state.nozzleMm} nozzle` : `${state.nozzleMm} nozzle`;
+  const n = exportedStack().length;
+  const total = n ? modelThickness({ mode: state.mode, ...heightOptions(), backingMm: backingMm() }, n) : 0;
+  $('sum-model').textContent = [n ? `${fmtMm(total)} mm` : '', effectiveOrientation() === 'down' ? 'face down' : '', state.backing ? 'backing' : '']
+    .filter(Boolean)
+    .join(' · ');
+  $('sum-vector').textContent = `${state.tolerance} px${state.curves ? ' · curves' : ''}`;
+}
+
 function updateExportButtons(): void {
   const ok = !state.loading && !!svgLayers();
   for (const id of ['export-3mf', 'export-svg', 'export-zip', 'export-png', 'export-json']) $<HTMLButtonElement>(id).disabled = !ok;
   renderHeights();
+  renderSummaries();
   const d = derived();
   const size = exportPngSize();
   $('export-info').textContent = state.image
@@ -770,6 +1043,7 @@ function settingsJson(): string {
 }
 
 function renderThin(r: PipelineResult): void {
+  renderSummaries();
   const el = $('thin-warning');
   const d = derived();
   if (r.thinCount < 0) {
@@ -801,6 +1075,7 @@ function renderThin(r: PipelineResult): void {
 }
 
 function renderDerived(): void {
+  renderSummaries();
   const d = derived();
   $('print-height').textContent = state.image ? `height ${d.heightMm.toFixed(1)} mm` : '';
   $('min-feature-info').textContent = `${d.minFeatureMm.toFixed(2)} mm` + (state.image ? ` ≈ ${d.minFeaturePx.toFixed(1)} px` : '');
@@ -817,11 +1092,12 @@ function renderDerived(): void {
   if (state.result) updateExportButtons();
 }
 
+let colorCountMsgShown = false;
 function renderRaster(r: PipelineResult): void {
   const canvas = $<HTMLCanvasElement>('raster-canvas');
   canvas.width = r.width;
   canvas.height = r.height;
-  const g = canvas.getContext('2d')!;
+  const g = canvas.getContext('2d', { willReadFrequently: true })!;
   const img = g.createImageData(r.width, r.height);
   const colors = paletteColors();
   const d = img.data;
@@ -836,14 +1112,16 @@ function renderRaster(r: PipelineResult): void {
   }
   g.putImageData(img, 0, 0);
   const k = r.quant.centroids.length;
-  setStatus(
+  const msg =
     k === 0
       ? 'The image is fully transparent; there is nothing to flatten.'
       : k < state.colors
         ? `Image only has ${k} distinct color${k === 1 ? '' : 's'}; using ${k}.`
-        : '',
-    k < state.colors ? 'warn' : 'info',
-  );
+        : '';
+  // Only replace or clear our own message, not other notices (e.g. project loaded).
+  if (msg) setStatus(msg, 'warn');
+  else if (colorCountMsgShown) setStatus('');
+  colorCountMsgShown = !!msg;
 }
 
 function renderPalette(): void {
@@ -913,6 +1191,7 @@ function updateMergeButton(): void {
 }
 
 function setStatus(text: string, kind: 'info' | 'warn' | 'error' = 'info'): void {
+  colorCountMsgShown = false;
   const el = $('status');
   el.textContent = text;
   el.className = `status ${kind === 'info' ? '' : kind}`;
@@ -987,7 +1266,17 @@ $('match-mine-btn').addEventListener('click', async () => {
 $('merge-btn').addEventListener('click', () => {
   const q = state.result?.quant;
   if (!q || state.selected.size < 2) return;
-  state.entries = mergeEntries(state.entries, [...state.selected], q.centroids, q.counts);
+  const sel = [...state.selected].sort((a, b) => a - b);
+  const targetId = state.entries[sel[0]].id;
+  const oldIds = state.entries.map((e) => e.id);
+  const targetIdFor = (i: number): number => oldIds[i];
+  state.entries = mergeEntries(state.entries, sel, q.centroids, q.counts);
+  if (paint.edits) {
+    // Strokes painted with a merged-away color now use the merged color.
+    remapEdits(paint.edits, new Map(sel.slice(1).map((i) => [targetIdFor(i), targetId] as [number, number])));
+    paint.setEdits(paint.edits);
+    updatePaintButtons();
+  }
   state.selected.clear();
   syncStack();
   renderPalette();
@@ -1008,7 +1297,7 @@ $<HTMLInputElement>('force-bw').addEventListener('change', (e) => {
   renderResult();
 });
 
-bindRange('mode', (v) => (v === 0 ? 'off' : `${v} pass${v > 1 ? 'es' : ''}`), (v) => (state.modeFilter = v));
+const setModeFilter = bindRange('mode', (v) => (v === 0 ? 'off' : `${v} pass${v > 1 ? 'es' : ''}`), (v) => (state.modeFilter = v));
 
 function bindNumber(id: string, min: number, max: number, apply: (v: number) => void): void {
   const input = $<HTMLInputElement>(id);
@@ -1042,9 +1331,9 @@ bindCheck('despeckle-auto', (v) => {
   if (!v) state.despeckleMm = Number($<HTMLInputElement>('despeckle-mm').value) || state.despeckleMm;
 });
 bindCheck('show-thin', (v) => (state.showThin = v), false);
-bindRange('tolerance', (v) => `${v} px` + (state.image ? ` ≈ ${(v / derived().pxPerMm).toFixed(2)} mm` : ''), (v) => (state.tolerance = v));
+const setTolerance = bindRange('tolerance', (v) => `${v} px` + (state.image ? ` ≈ ${(v / derived().pxPerMm).toFixed(2)} mm` : ''), (v) => (state.tolerance = v));
 bindCheck('curves', (v) => (state.curves = v));
-bindRange('bleed', (v) => (v === 0 ? 'off' : `${v.toFixed(2)} mm`), (v) => (state.bleedMm = v));
+const setBleed = bindRange('bleed', (v) => (v === 0 ? 'off' : `${v.toFixed(2)} mm`), (v) => (state.bleedMm = v));
 for (const b of $('mode-seg').querySelectorAll<HTMLButtonElement>('button')) {
   b.addEventListener('click', () => {
     state.mode = b.dataset.mode as ExportMode;
@@ -1055,12 +1344,14 @@ for (const b of $('mode-seg').querySelectorAll<HTMLButtonElement>('button')) {
     schedule(0);
   });
 }
+function setView(v: 'raster' | 'vector'): void {
+  state.view = v;
+  $('view-seg').querySelectorAll<HTMLButtonElement>('button').forEach((x) => x.classList.toggle('on', x.dataset.view === v));
+  if (v === 'vector' && paint.tool !== 'pan') setTool('pan');
+  renderVector();
+}
 for (const b of $('view-seg').querySelectorAll<HTMLButtonElement>('button')) {
-  b.addEventListener('click', () => {
-    state.view = b.dataset.view as 'raster' | 'vector';
-    $('view-seg').querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
-    renderVector();
-  });
+  b.addEventListener('click', () => setView(b.dataset.view as 'raster' | 'vector'));
 }
 function bindHeight(id: string, apply: (v: number) => void): void {
   const input = $<HTMLInputElement>(id);
@@ -1120,6 +1411,61 @@ $<HTMLInputElement>('bg-color').addEventListener('input', (e) => {
 });
 renderDerived();
 
+/** Push every setting in `state` into its control (used after loading a project). */
+function syncControls(): void {
+  setColors(state.colors);
+  setBlur(state.blur);
+  setModeFilter(state.modeFilter);
+  setTolerance(state.tolerance);
+  setBleed(state.bleedMm);
+  $('seed-out').textContent = String(state.seed);
+  const num = (id: string, v: number): void => void ($<HTMLInputElement>(id).value = String(v));
+  num('despeckle-mm', state.despeckleMm);
+  num('print-width', state.printWidthMm);
+  num('nozzle', state.nozzleMm);
+  num('feature-mult', state.featureMult);
+  num('base-mm', state.baseMm);
+  num('step-mm', state.stepMm);
+  num('cutout-mm', state.cutoutMm);
+  num('backing-mm', state.backingMm);
+  const chk = (id: string, v: boolean): void => void ($<HTMLInputElement>(id).checked = v);
+  chk('force-bw', state.forceBW);
+  chk('despeckle', state.despeckle);
+  chk('despeckle-auto', state.despeckleAuto);
+  chk('show-thin', state.showThin);
+  chk('curves', state.curves);
+  chk('backing', state.backing);
+  chk('bg', state.background);
+  $<HTMLInputElement>('bg-color').value = state.backgroundColor.toLowerCase();
+  $<HTMLInputElement>('bg-color').disabled = !state.background;
+  $<HTMLInputElement>('backing-custom').value = state.backingCustom.toLowerCase();
+  $('mode-seg').querySelectorAll<HTMLButtonElement>('button').forEach((b) => b.classList.toggle('on', b.dataset.mode === state.mode));
+  $('bleed-field').hidden = state.mode !== 'cutout';
+  setView(state.view);
+  renderDerived();
+  renderHeights();
+}
+
+// Remember which sidebar sections are open (per browser).
+const SECTIONS_KEY = 'imageflattener.sections.v1';
+try {
+  const saved = JSON.parse(localStorage.getItem(SECTIONS_KEY) ?? 'null') as Record<string, boolean> | null;
+  if (saved) for (const d of document.querySelectorAll<HTMLDetailsElement>('details.sec')) if (d.dataset.sec! in saved) d.open = saved[d.dataset.sec!];
+} catch {
+  /* storage unavailable */
+}
+for (const d of document.querySelectorAll<HTMLDetailsElement>('details.sec')) {
+  d.addEventListener('toggle', () => {
+    const v: Record<string, boolean> = {};
+    for (const x of document.querySelectorAll<HTMLDetailsElement>('details.sec')) v[x.dataset.sec!] = x.open;
+    try {
+      localStorage.setItem(SECTIONS_KEY, JSON.stringify(v));
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
 $('seed-out').textContent = String(state.seed);
 $('reseed-btn').addEventListener('click', () => {
   state.seed = (Math.random() * 0xffffffff) >>> 0 || 1;
@@ -1128,9 +1474,14 @@ $('reseed-btn').addEventListener('click', () => {
 });
 
 // ------------------------------------------------------------- loading ----
-async function openBlob(blob: Blob, name: string): Promise<void> {
+async function openBlob(blob: Blob, name: string, restore: Restore | null = null): Promise<void> {
   state.loading = true;
   state.result = null;
+  // A new image starts without brush edits (a project restores its own).
+  paint.reset();
+  sentEditsVersion = -1;
+  pendingRestore = restore;
+  updatePaintButtons();
   updateExportButtons();
   updateBusy();
   try {
@@ -1146,7 +1497,7 @@ async function openBlob(blob: Blob, name: string): Promise<void> {
     const c = $<HTMLCanvasElement>('raster-canvas');
     c.width = w;
     c.height = h;
-    c.getContext('2d')!.clearRect(0, 0, w, h);
+    c.getContext('2d', { willReadFrequently: true })!.clearRect(0, 0, w, h);
     viewports.setContentSize(w, h);
     renderDerived();
     viewports.fit();
@@ -1154,6 +1505,7 @@ async function openBlob(blob: Blob, name: string): Promise<void> {
       `${name} · ${img.originalWidth}×${img.originalHeight}` + (w !== img.originalWidth ? ` (working ${w}×${h})` : '');
     // Copy: the buffer is transferred to the worker.
     client.setImage(state.imageVersion, w, h, img.working.data.slice());
+    $<HTMLButtonElement>('save-project-btn').disabled = false;
     state.loading = false;
     updateBusy();
     renderVector();
@@ -1169,7 +1521,23 @@ $('open-btn').addEventListener('click', () => $<HTMLInputElement>('file-input').
 $<HTMLInputElement>('file-input').addEventListener('change', (e) => {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
-  if (file) void openBlob(file, file.name);
+  if (file) void openFile(file);
+  input.value = '';
+});
+
+/** Open an image or a saved project. */
+function openFile(file: File): Promise<void> {
+  return isProjectFile(file) ? loadProjectFile(file) : openBlob(file, file.name);
+}
+
+$('save-project-btn').addEventListener('click', () => {
+  saveProject().catch((err) => setStatus(err instanceof Error ? err.message : String(err), 'error'));
+});
+$('open-project-btn').addEventListener('click', () => $<HTMLInputElement>('project-input').click());
+$<HTMLInputElement>('project-input').addEventListener('change', (e) => {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (file) void loadProjectFile(file);
   input.value = '';
 });
 
@@ -1200,8 +1568,8 @@ for (const view of [$('view-original'), $('view-preview')]) {
   view.addEventListener('drop', (e) => {
     e.preventDefault();
     view.classList.remove('drop-target');
-    const file = [...(e.dataTransfer?.files ?? [])].find((f) => f.type.startsWith('image/'));
-    if (file) void openBlob(file, file.name);
+    const file = [...(e.dataTransfer?.files ?? [])].find((f) => f.type.startsWith('image/') || isProjectFile(f));
+    if (file) void openFile(file);
   });
 }
 document.addEventListener('paste', (e) => {

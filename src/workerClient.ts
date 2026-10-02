@@ -34,6 +34,12 @@ export class WorkerClient {
     this.worker.postMessage(msg, [data.buffer]);
   }
 
+  /** Send the brush-edit layer (palette-entry-id space); referenced by version in later requests. */
+  setEdits(version: number, width: number, height: number, data: Uint8Array): void {
+    const msg: WorkerRequest = { type: 'edits', version, width, height, data };
+    this.worker.postMessage(msg);
+  }
+
   process(params: PipelineParams): void {
     if (this.busyId) {
       this.pending = params;

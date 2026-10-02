@@ -7,6 +7,8 @@ export const EXPORT_MAX = 8192;
 
 export interface LoadedImage {
   name: string;
+  /** The original file (kept for saving projects). */
+  blob: Blob;
   /** Object URL of the original file, for display. */
   url: string;
   originalWidth: number;
@@ -59,6 +61,7 @@ export async function loadImage(blob: Blob, name: string): Promise<LoadedImage> 
   const data = g.getImageData(0, 0, w, h).data;
   return {
     name,
+    blob,
     url: URL.createObjectURL(blob),
     originalWidth: ow,
     originalHeight: oh,

@@ -10,13 +10,22 @@ export class ViewportGroup {
   private contentH = 1;
   private readonly panes: { container: HTMLElement; content: HTMLElement }[] = [];
 
+  /** Return false to leave a pointer-down to another handler (e.g. the brush). */
+  canPan: (e: PointerEvent, container: HTMLElement) => boolean = () => true;
+
+  getScale(): number {
+    return this.scale;
+  }
+
   add(container: HTMLElement, content: HTMLElement): void {
     this.panes.push({ container, content });
     container.addEventListener('wheel', (e) => this.onWheel(e, container), { passive: false });
     container.addEventListener('dblclick', () => this.fit());
     let drag: { id: number; x: number; y: number } | null = null;
     container.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 && e.button !== 1) return;
+      if (e.button === 0 && !this.canPan(e, container)) return;
+      if (e.button === 1) e.preventDefault();
       drag = { id: e.pointerId, x: e.clientX, y: e.clientY };
       container.setPointerCapture(e.pointerId);
       container.classList.add('dragging');

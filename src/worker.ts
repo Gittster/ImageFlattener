@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 import { blurImage } from './core/blur';
 import { despeckle, modeFilter, thinFeatureSteps, type ThinFeatures } from './core/cleanup';
+import { applyEdits } from './core/edits';
 import { applyGroups, countLabels } from './core/palette';
 import { quantize, type QuantizeResult } from './core/quantize';
 import { zipSync, strToU8 } from 'fflate';
@@ -18,6 +19,9 @@ let image: RasterImage | null = null;
 let imageVersion = 0;
 let quantCache: { key: string; result: QuantizeResult } | null = null;
 let cleanCache: { key: string; map: LabelMap; minFeaturePx: number; thin: ThinFeatures | null } | null = null;
+/** The label map after brush edits (what is displayed, traced and exported). */
+let finalCache: { key: string; map: LabelMap; minFeaturePx: number; thin: ThinFeatures | null } | null = null;
+let edits: { version: number; width: number; height: number; data: Uint8Array } | null = null;
 /** Incremented on every incoming message; background work stops when it changes. */
 let messageSerial = 0;
 let graphCache: { key: string; cleanKey: string; graph: EdgeGraph } | null = null;
@@ -61,15 +65,24 @@ function run(id: number, params: PipelineParams): PipelineResult {
     if (c.despeckleArea > 1) map = despeckle(map, c.despeckleArea);
     cleanCache = { key: cKey, map, minFeaturePx: c.minFeaturePx, thin: null };
   }
-  const labels = cleanCache.map.labels;
+
+  // Brush edits are applied after cleanup so despeckle never removes them.
+  const e = params.edits;
+  const useEdits = e.version > 0 && edits !== null && edits.version === e.version && edits.width === quant.width && edits.height === quant.height;
+  const fKey = useEdits ? JSON.stringify([cKey, e.version, e.idToIndex]) : cKey;
+  if (!finalCache || finalCache.key !== fKey) {
+    const map = useEdits ? applyEdits(cleanCache.map, edits!.data, e.idToIndex) : cleanCache.map;
+    finalCache = { key: fKey, map, minFeaturePx: c.minFeaturePx, thin: null };
+  }
+  const labels = finalCache.map.labels;
 
   let vector: VectorResult | null = null;
   const v = params.vector;
   if (v && entryCount > 0) {
-    const gKey = JSON.stringify([cKey, v.tolerance, v.curves]);
+    const gKey = JSON.stringify([fKey, v.tolerance, v.curves]);
     if (!graphCache || graphCache.key !== gKey) {
       post({ type: 'progress', id, stage: 'Tracing shapes…' });
-      graphCache = { key: gKey, cleanKey: cKey, graph: traceEdges(cleanCache.map, { tolerance: v.tolerance, curves: v.curves }) };
+      graphCache = { key: gKey, cleanKey: fKey, graph: traceEdges(finalCache.map, { tolerance: v.tolerance, curves: v.curves }) };
     }
     // A stack made for a different palette is replaced by the default order.
     const valid =
@@ -91,10 +104,11 @@ function run(id: number, params: PipelineParams): PipelineResult {
     quant: { key: qKey, centroids: quant.centroids, counts: quant.counts },
     entryCount,
     labels: labels.slice(),
+    baseLabels: useEdits ? cleanCache.map.labels.slice() : new Uint8Array(0),
     counts: countLabels(labels, entryCount),
-    cleanKey: cKey,
-    thinCount: cleanCache.thin ? cleanCache.thin.count : -1,
-    thinMask: cleanCache.thin ? cleanCache.thin.mask.slice() : new Uint8Array(0),
+    cleanKey: fKey,
+    thinCount: finalCache.thin ? finalCache.thin.count : -1,
+    thinMask: finalCache.thin ? finalCache.thin.mask.slice() : new Uint8Array(0),
     vector,
   };
 }
@@ -102,8 +116,8 @@ function run(id: number, params: PipelineParams): PipelineResult {
 /** Full-resolution flattened PNG, nearest-neighbour mapped from the label map. */
 async function renderPng(id: number, ow: number, oh: number, colors: (RGB | null)[]): Promise<void> {
   try {
-    if (!cleanCache) throw new Error('Nothing to export yet');
-    const { width: w, height: h, labels } = cleanCache.map;
+    if (!finalCache) throw new Error('Nothing to export yet');
+    const { width: w, height: h, labels } = finalCache.map;
     const lut = new Uint32Array(256);
     const little = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
     colors.forEach((c, i) => {
@@ -140,12 +154,12 @@ async function renderPng(id: number, ow: number, oh: number, colors: (RGB | null
  * been posted, one color per task, and is abandoned when a new message arrives.
  */
 function computeThinInBackground(): void {
-  const cache = cleanCache;
+  const cache = finalCache;
   if (!cache || cache.thin) return;
   const serial = messageSerial;
   const steps = thinFeatureSteps(cache.map, cache.minFeaturePx);
   const step = (): void => {
-    if (serial !== messageSerial || cleanCache !== cache) return;
+    if (serial !== messageSerial || finalCache !== cache) return;
     const r = steps.next();
     if (!r.done) {
       setTimeout(step, 0);
@@ -182,8 +196,14 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
     imageVersion = msg.version;
     quantCache = null;
     cleanCache = null;
+    finalCache = null;
+    edits = null;
     graphCache = null;
     vectorCache = null;
+    return;
+  }
+  if (msg.type === 'edits') {
+    edits = { version: msg.version, width: msg.width, height: msg.height, data: msg.data };
     return;
   }
   if (msg.type === 'png') {
@@ -196,7 +216,7 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   }
   try {
     const result = run(msg.id, msg.params);
-    post({ type: 'result', id: msg.id, result }, [result.labels.buffer, result.thinMask.buffer]);
+    post({ type: 'result', id: msg.id, result }, [result.labels.buffer, result.baseLabels.buffer, result.thinMask.buffer]);
     computeThinInBackground();
   } catch (err) {
     if (err instanceof StaleRequest) post({ type: 'error', id: msg.id, message: '' });
