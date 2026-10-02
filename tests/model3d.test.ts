@@ -95,6 +95,50 @@ describe('3D layers', () => {
   });
 });
 
+describe('orientation and backing', () => {
+  // Color 0 on the left half, color 1 on the right half, transparent corner.
+  const w = 20, h = 10;
+  const labels = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) labels[y * w + x] = x < 10 ? 0 : 1;
+  labels[0] = VOID;
+  const graph = traceEdges({ width: w, height: h, labels }, { tolerance: 0.5, curves: false });
+  const opts = { baseMm: 0.6, stepMm: 0.3, cutoutMm: 1, mmPerPx: 1, stack: [0, 1], colors: ['#000000', '#FFFFFF'], names: ['a', 'b'] };
+  const bounds = (m: Mesh): { x: [number, number]; z: [number, number] } => {
+    const xs = m.positions.filter((_, i) => i % 3 === 0);
+    const zs = m.positions.filter((_, i) => i % 3 === 2);
+    return { x: [Math.min(...xs), Math.max(...xs)], z: [Math.min(...zs), Math.max(...zs)] };
+  };
+
+  it('face up with backing: backing on the plate, image on top', () => {
+    const parts = buildParts(graph, { ...opts, mode: 'cutout', backingMm: 0.5, backingColor: '#ff0000' });
+    expect(parts.map((p) => p.name)).toEqual(['Backing #FF0000', 'a', 'b']);
+    expect(bounds(parts[0].mesh).z).toEqual([0, 0.5]);
+    expect(bounds(parts[1].mesh).z).toEqual([0.5, 1.5]);
+    // The backing covers the whole silhouette (both colors), minus the transparent pixel.
+    expect(meshVolume(parts[0].mesh)).toBeCloseTo((w * h - 1) * 0.5, 0);
+    for (const p of parts) expect(isClosedManifold(p.mesh) && meshVolume(p.mesh) > 0).toBe(true);
+  });
+
+  it('face down: image flat on the plate, mirrored, backing on top', () => {
+    const parts = buildParts(graph, { ...opts, mode: 'cutout', orientation: 'down', backingMm: 0.5 });
+    const [backing, left, right] = parts.map((p) => bounds(p.mesh));
+    expect(left.z).toEqual([0, 1]);
+    expect(right.z).toEqual([0, 1]);
+    expect(backing.z).toEqual([1, 1.5]);
+    // Color 0 (left half of the image) ends up on the right after turning over.
+    expect(left.x[0]).toBeCloseTo(10, 6);
+    expect(right.x[1]).toBeCloseTo(10, 6);
+    // Rotation, not a mirror: meshes stay outward-facing.
+    for (const p of parts) expect(isClosedManifold(p.mesh) && meshVolume(p.mesh) > 0).toBe(true);
+  });
+
+  it('ignores face down for stacked mode (its top is not flat)', () => {
+    const up = buildParts(graph, { ...opts, mode: 'stacked' });
+    const down = buildParts(graph, { ...opts, mode: 'stacked', orientation: 'down' });
+    expect(down.map((p) => p.mesh.positions)).toEqual(up.map((p) => p.mesh.positions));
+  });
+});
+
 describe('3MF package', () => {
   it('declares a color group and one colored part per layer inside a single object', () => {
     const square = emptyMesh();

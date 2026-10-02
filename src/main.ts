@@ -1,6 +1,6 @@
 import './style.css';
 import { hexToRgb, lightness, rgbToHex, type RGB } from './core/color';
-import { layerZRanges, type HeightOptions } from './core/model3d';
+import { canFaceDown, layerZRanges, modelThickness, type HeightOptions, type Orientation } from './core/model3d';
 import type { ExportMode, SvgLayer } from './core/svg';
 import { layerId, svgDocument } from './core/svg';
 import { baseName, downloadBlob, svgBlob, zipBlob } from './exporters';
@@ -127,8 +127,25 @@ app.innerHTML = `
         </div>
         <div class="hint" id="heights-hint"></div>
       </div>
+      <div class="field">
+        <div class="label"><span>3D model options</span></div>
+        <div class="row" style="margin-bottom:6px">
+          <span>Image face</span>
+          <div class="seg" id="orient-seg">
+            <button data-orient="up" class="on" title="Image on top, as seen from above">Up</button>
+            <button data-orient="down" title="Turn the model over so the image prints flat against the build plate (mirrored automatically)">Down (on plate)</button>
+          </div>
+        </div>
+        <label class="check"><input id="backing" type="checkbox" /> Backing layer behind the image</label>
+        <div class="row" id="backing-row" hidden>
+          <label class="inline"><input id="backing-mm" type="number" min="0.08" max="20" step="0.04" value="0.6" aria-label="Backing thickness in mm" /> mm</label>
+          <select id="backing-select" aria-label="Backing color"></select>
+          <input id="backing-custom" type="color" value="#ffffff" aria-label="Custom backing color" hidden />
+        </div>
+        <div class="hint" id="orient-hint"></div>
+      </div>
       <div class="row" style="margin-bottom:10px">
-        <label class="check" style="margin:0"><input id="bg" type="checkbox" /> Background rect</label>
+        <label class="check" style="margin:0" title="Adds a filled rectangle behind the shapes in SVG exports only (not a 3D backing)"><input id="bg" type="checkbox" /> SVG background rect</label>
         <input id="bg-color" type="color" value="#ffffff" aria-label="Background color" disabled />
       </div>
       <button id="export-3mf" class="primary wide" disabled title="3MF project for Bambu Studio: one part per color, colors pre-assigned">Bambu Studio 3MF (colors assigned)</button>
@@ -215,6 +232,12 @@ interface State {
   baseMm: number;
   stepMm: number;
   cutoutMm: number;
+  orientation: Orientation;
+  backing: boolean;
+  backingMm: number;
+  /** Palette entry id (as a string) or 'custom'. */
+  backingChoice: string;
+  backingCustom: string;
 }
 
 const state: State = {
@@ -249,6 +272,11 @@ const state: State = {
   baseMm: 0.64,
   stepMm: 0.32,
   cutoutMm: 1.2,
+  orientation: 'up',
+  backing: false,
+  backingMm: 0.6,
+  backingChoice: '',
+  backingCustom: '#FFFFFF',
   view: 'raster',
 };
 
@@ -416,7 +444,7 @@ function renderStack(): void {
     const idx = state.entries.findIndex((e) => e.id === state.stackIds[pos]);
     layerNo.push(counts && idx >= 0 && counts[idx] === 0 ? 0 : next++);
   }
-  const z = layerZRanges(state.mode, next - 1, heightOptions());
+  const z = colorZRanges(next - 1);
   // Display top of the stack first.
   for (let pos = n - 1; pos >= 0; pos--) {
     const idx = state.entries.findIndex((e) => e.id === state.stackIds[pos]);
@@ -513,14 +541,68 @@ function heightOptions(): HeightOptions {
   return { baseMm: state.baseMm, stepMm: state.stepMm, cutoutMm: state.cutoutMm };
 }
 
+/** Orientation actually used (face down needs a flat face, i.e. cutout mode). */
+function effectiveOrientation(): Orientation {
+  return canFaceDown(state.mode) ? state.orientation : 'up';
+}
+
+function backingMm(): number {
+  return state.backing ? state.backingMm : 0;
+}
+
+/** Backing color: a palette color (by entry id) or a custom color. */
+function backingHex(): string {
+  if (state.backingChoice !== 'custom') {
+    const hex = paletteHex();
+    const idx = state.entries.findIndex((e) => String(e.id) === state.backingChoice);
+    if (idx >= 0) return hex[idx];
+    const bottom = exportedStack()[0];
+    if (bottom !== undefined) return hex[bottom];
+  }
+  return state.backingCustom;
+}
+
+/** Z ranges of the color layers in the exported model (face up, after backing). */
+function colorZRanges(n: number): [number, number][] {
+  const off = effectiveOrientation() === 'up' ? backingMm() : 0;
+  return layerZRanges(state.mode, n, heightOptions()).map(([a, b]) => [a + off, b + off]);
+}
+
+function renderBackingSelect(): void {
+  const sel = $<HTMLSelectElement>('backing-select');
+  const hex = paletteHex();
+  const options = exportedStack().map((i) => ({ value: String(state.entries[i].id), label: hex[i] }));
+  if (!options.some((o) => o.value === state.backingChoice) && state.backingChoice !== 'custom') {
+    state.backingChoice = options[0]?.value ?? 'custom';
+  }
+  sel.innerHTML =
+    options.map((o) => `<option value="${o.value}">${o.label}</option>`).join('') + '<option value="custom">Custom color…</option>';
+  sel.value = state.backingChoice;
+  const chosen = backingHex();
+  sel.style.borderLeft = `14px solid ${chosen}`;
+  $('backing-custom').hidden = state.backingChoice !== 'custom';
+}
+
 const fmtMm = (v: number): string => `${Math.round(v * 100) / 100}`;
 
 function renderHeights(): void {
   $('heights-stacked').hidden = state.mode !== 'stacked';
   $('heights-cutout').hidden = state.mode !== 'cutout';
   const n = exportedStack().length;
-  const z = layerZRanges(state.mode, n, heightOptions());
-  $('heights-total').textContent = n ? `total ${fmtMm(z[n - 1]?.[1] ?? 0)} mm` : '';
+  const total = n ? modelThickness({ mode: state.mode, ...heightOptions(), backingMm: backingMm() }, n) : 0;
+  $('heights-total').textContent = n ? `total ${fmtMm(total)} mm` : '';
+  const down = $('orient-seg').querySelector<HTMLButtonElement>('[data-orient=down]')!;
+  down.disabled = !canFaceDown(state.mode);
+  $('orient-seg').querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.orient === effectiveOrientation()));
+  $('backing-row').hidden = !state.backing;
+  renderBackingSelect();
+  $('orient-hint').textContent = !canFaceDown(state.mode)
+    ? 'Face down needs a flat image face, so it is only available in Cutout mode (stacked layers have a stepped top).'
+    : effectiveOrientation() === 'down'
+      ? `The model is turned over: the image prints first, flat against the plate, mirrored so it reads correctly when flipped back.${state.backing ? ' The backing is printed last, on top.' : ''}`
+      : state.backing
+        ? 'The backing is printed first; the image sits on top of it.'
+        : '';
   $('heights-hint').textContent =
     state.mode === 'stacked'
       ? 'Each color fills the band from the top of the color below up to its own height. Use a 0.08 mm layer profile so each band is several layers thick.'
@@ -589,6 +671,9 @@ $('export-3mf').addEventListener('click', async () => {
         names: stack.map((i, k) => `${k + 1} ${hex[i]}`),
         mmPerPx: 1 / derived().pxPerMm,
         ...heightOptions(),
+        orientation: effectiveOrientation(),
+        backingMm: backingMm(),
+        backingColor: backingHex(),
       },
       baseName(state.image?.name ?? 'image'),
     );
@@ -634,7 +719,10 @@ function settingsJson(): string {
     model3d: {
       mode: state.mode,
       ...heightOptions(),
-      layers: layerZRanges(state.mode, stack.length, heightOptions()).map(([z0, z1], k) => ({
+      orientation: effectiveOrientation(),
+      backing: state.backing ? { thicknessMm: state.backingMm, color: backingHex() } : null,
+      // Heights as printed face up (face-down models are turned over on export).
+      layers: colorZRanges(stack.length).map(([z0, z1], k) => ({
         color: hex[stack[k]],
         zBottomMm: Math.round(z0 * 1000) / 1000,
         zTopMm: Math.round(z1 * 1000) / 1000,
@@ -773,6 +861,7 @@ function renderPalette(): void {
       (swatch as HTMLElement).style.background = e.override;
       if (state.result) renderRaster(state.result);
       renderStack();
+      renderHeights();
     });
     picker.addEventListener('change', () => renderResult());
     revert.addEventListener('click', () => {
@@ -907,6 +996,27 @@ function bindHeight(id: string, apply: (v: number) => void): void {
 bindHeight('base-mm', (v) => (state.baseMm = v));
 bindHeight('step-mm', (v) => (state.stepMm = v));
 bindHeight('cutout-mm', (v) => (state.cutoutMm = v));
+bindHeight('backing-mm', (v) => (state.backingMm = v));
+$<HTMLInputElement>('backing').addEventListener('change', (e) => {
+  state.backing = (e.target as HTMLInputElement).checked;
+  renderStack();
+  renderHeights();
+});
+$<HTMLSelectElement>('backing-select').addEventListener('change', (e) => {
+  state.backingChoice = (e.target as HTMLSelectElement).value;
+  renderHeights();
+});
+$<HTMLInputElement>('backing-custom').addEventListener('input', (e) => {
+  state.backingCustom = (e.target as HTMLInputElement).value.toUpperCase();
+  renderHeights();
+});
+for (const b of $('orient-seg').querySelectorAll<HTMLButtonElement>('button')) {
+  b.addEventListener('click', () => {
+    state.orientation = b.dataset.orient as Orientation;
+    renderStack();
+    renderHeights();
+  });
+}
 renderHeights();
 $('sort-stack').addEventListener('click', () => {
   const hex = paletteHex();

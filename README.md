@@ -96,7 +96,9 @@ The panel also shows the resulting mm-per-pixel resolution. It warns when a pixe
 * **3D model heights** (used by the 3MF export):
   * **Stacked:** the bottom color is a **base** slab (default 0.64 mm = 8 layers at 0.08 mm). Each further color adds a band (default **0.32 mm** = 4 layers). A color's part fills its band only where that color or any color above it appears. So parts never overlap, and from above every pixel shows its own color. The stack list shows each color's height band.
   * **Cutout:** every part has the same **thickness** (default 1.2 mm) for a flush print.
-* **Background rect**: optionally adds a full-size `<rect id="background">` behind the layers.
+* **Image face Up / Down (on plate)** (3MF): *Down* turns the model over, rotating it 180° about the Y axis. The image then prints first, flat against the build plate (smooth or textured, like your plate), and is mirrored so it reads correctly once flipped back. This needs a flat image face, so it is only available in **Cutout** mode; a stacked model's top is stepped.
+* **Backing layer** (3MF): a solid slab with the outline of the whole image (its silhouette) behind the colors, with its own thickness and color. The color can be one of the palette colors, which shares that filament slot, or a custom color, which gets its own slot. Face up, it is printed first, under the image; face down, it is printed last, on top. Without a backing, cutout colors go straight through the full thickness.
+* **SVG background rect**: optionally adds a full-size `<rect id="background">` behind the layers in SVG exports. It is not a 3D backing.
 
 | Button | Output |
 |---|---|
