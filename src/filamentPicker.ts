@@ -4,7 +4,9 @@ import {
   loadFilamentLibrary,
   type Filament,
 } from './core/filaments';
+import { stockLabel } from './core/spoolman';
 import { loadMyFilaments, loadPickerPrefs, saveMyFilaments, savePickerPrefs, type MyFilaments } from './myFilaments';
+import { serverConfig, setSpoolmanUrl, spoolmanInventory, type SpoolmanState } from './server';
 
 const MAX_ROWS = 150;
 
@@ -26,22 +28,44 @@ const esc = (s: string): string =>
 
 let library: Filament[] = [];
 let librarySource = '';
+/** Filaments on hand from Spoolman (empty without a server/Spoolman). */
+let stock: Filament[] = [];
+let stockState: { info: SpoolmanState | null; error: string | null } = { info: null, error: null };
 let mine: MyFilaments = loadMyFilaments();
 let dialog: HTMLDialogElement | null = null;
 let opts: PickerOptions = {};
 let query = '';
 const prefs = loadPickerPrefs();
 
-/** All filaments in "My filaments" (library entries + custom ones). */
+/** All filaments in "My filaments" (Spoolman stock + starred library entries + custom ones). */
 export async function getMyFilaments(): Promise<Filament[]> {
-  await ensureLibrary();
+  await Promise.all([ensureLibrary(), loadStock(false)]);
   mine = loadMyFilaments();
   const ids = new Set(mine.ids);
-  return [...library.filter((f) => ids.has(f.id)), ...mine.custom];
+  return [...stock, ...library.filter((f) => ids.has(f.id)), ...mine.custom];
 }
 
 export function myFilamentCount(): number {
-  return mine.ids.length + mine.custom.length;
+  mine = loadMyFilaments();
+  return stock.length + mine.ids.length + mine.custom.length;
+}
+
+/** Spoolman status for the sidebar: null when Spoolman isn't set up. */
+export function spoolmanStatus(): { count: number; error: string | null } | null {
+  if (stockState.error) return { count: 0, error: stockState.error };
+  return stockState.info ? { count: stock.length, error: null } : null;
+}
+
+/** (Re)load the Spoolman inventory. Never throws; errors are kept for display. */
+export async function loadStock(refresh: boolean): Promise<void> {
+  try {
+    const info = await spoolmanInventory(refresh);
+    stockState = { info, error: null };
+    stock = info?.filaments ?? [];
+  } catch (err) {
+    stockState = { info: null, error: err instanceof Error ? err.message : String(err) };
+    stock = [];
+  }
 }
 
 async function ensureLibrary(): Promise<void> {
@@ -52,10 +76,12 @@ async function ensureLibrary(): Promise<void> {
 }
 
 function isMine(f: Filament): boolean {
+  if (f.stock) return true;
   return f.custom ? mine.custom.some((c) => c.id === f.id) : mine.ids.includes(f.id);
 }
 
 function toggleMine(f: Filament): void {
+  if (f.stock) return; // managed in Spoolman
   if (f.custom) mine.custom = mine.custom.filter((c) => c.id !== f.id);
   else if (mine.ids.includes(f.id)) mine.ids = mine.ids.filter((id) => id !== f.id);
   else mine.ids = [...mine.ids, f.id];
@@ -91,6 +117,17 @@ function build(): HTMLDialogElement {
         <button type="button" class="fd-c-add">Add to my filaments</button>
       </div>
     </details>
+    <div class="fd-spoolman" hidden>
+      <span class="fd-sm-status"></span>
+      <span class="spacer"></span>
+      <button type="button" class="fd-sm-refresh">Refresh</button>
+      <button type="button" class="fd-sm-edit">Spoolman URL…</button>
+      <form class="fd-sm-form row" hidden>
+        <input class="fd-sm-url" type="text" placeholder="http://192.168.1.20:7912" aria-label="Spoolman URL" />
+        <button type="submit">Save</button>
+        <span class="hint fd-sm-hint"></span>
+      </form>
+    </div>
     <div class="fd-foot">
       <span class="hint fd-source"></span>
       <span class="spacer"></span>
@@ -126,6 +163,40 @@ function build(): HTMLDialogElement {
     q<HTMLInputElement>('.fd-c-name').value = '';
     renderList();
   });
+  q<HTMLButtonElement>('.fd-sm-refresh').addEventListener('click', async () => {
+    q('.fd-sm-status').textContent = 'Refreshing from Spoolman…';
+    await loadStock(true);
+    opts.onMineChange?.();
+    await renderSpoolman();
+    renderList();
+  });
+  q<HTMLButtonElement>('.fd-sm-edit').addEventListener('click', async () => {
+    const form = q<HTMLFormElement>('.fd-sm-form');
+    form.hidden = !form.hidden;
+    if (!form.hidden) {
+      const c = await serverConfig();
+      q<HTMLInputElement>('.fd-sm-url').value = c?.spoolman.url ?? '';
+      q('.fd-sm-hint').textContent = c?.spoolman.envUrl
+        ? `Leave empty to use the container's SPOOLMAN_URL (${c.spoolman.envUrl}).`
+        : 'The address you open Spoolman at, e.g. http://192.168.1.20:7912.';
+      q<HTMLInputElement>('.fd-sm-url').focus();
+    }
+  });
+  q<HTMLFormElement>('.fd-sm-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const hint = q('.fd-sm-hint');
+    try {
+      await setSpoolmanUrl(q<HTMLInputElement>('.fd-sm-url').value);
+      q<HTMLFormElement>('.fd-sm-form').hidden = true;
+      q('.fd-sm-status').textContent = 'Connecting to Spoolman…';
+      await loadStock(true);
+      opts.onMineChange?.();
+      await renderSpoolman();
+      renderList();
+    } catch (err) {
+      hint.textContent = err instanceof Error ? err.message : String(err);
+    }
+  });
   q<HTMLButtonElement>('.fd-clear').addEventListener('click', () => {
     opts.onPick?.(null);
     d.close();
@@ -145,9 +216,35 @@ function fillSelect(sel: HTMLSelectElement, all: string, values: string[], curre
 function candidates(): Filament[] {
   if (prefs.onlyMine) {
     const ids = new Set(mine.ids);
-    return [...library.filter((f) => ids.has(f.id)), ...mine.custom];
+    return [...stock, ...library.filter((f) => ids.has(f.id)), ...mine.custom];
   }
-  return [...mine.custom, ...library];
+  return [...stock, ...mine.custom, ...library];
+}
+
+/** The Spoolman bar: shown with the self-hosted server. */
+async function renderSpoolman(): Promise<void> {
+  if (!dialog) return;
+  const bar = dialog.querySelector<HTMLElement>('.fd-spoolman')!;
+  const c = await serverConfig();
+  bar.hidden = !c;
+  if (!c) return;
+  const status = dialog.querySelector<HTMLElement>('.fd-sm-status')!;
+  status.classList.toggle('error', !!stockState.error);
+  dialog.querySelector<HTMLButtonElement>('.fd-sm-refresh')!.hidden = !c.spoolman.url;
+  if (!c.spoolman.url) {
+    status.textContent = 'Spoolman: not connected. Set its URL to use the spools you have on hand.';
+  } else if (stockState.error) {
+    status.textContent = `Spoolman: ${stockState.error}`;
+  } else if (stockState.info) {
+    const i = stockState.info;
+    const empty = i.skipped.filter((x) => x.reason === 'empty').length;
+    const noColor = i.skipped.filter((x) => x.reason === 'no color').length;
+    const notes = [empty ? `${empty} empty spool${empty === 1 ? '' : 's'}` : '', noColor ? `${noColor} without a color` : ''].filter(Boolean);
+    status.textContent =
+      `Spoolman: ${stock.length} filament${stock.length === 1 ? '' : 's'} on hand` +
+      (notes.length ? ` (skipped ${notes.join(', ')})` : '') +
+      ` · ${i.loadedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  }
 }
 
 function renderList(): void {
@@ -176,6 +273,7 @@ function renderList(): void {
     const li = document.createElement('li');
     const chosen = opts.current?.id === f.id;
     const tags = [
+      f.stock ? `on hand: ${stockLabel(f)}` : '',
       f.custom ? 'custom' : '',
       f.translucent ? 'translucent' : '',
       f.silk ? 'silk' : '',
@@ -193,25 +291,30 @@ function renderList(): void {
         </span>
         ${dE !== null ? `<span class="fd-de" title="Color difference (CIEDE2000): under 2 is hard to tell apart, over 10 is a clearly different color">ΔE ${dE.toFixed(1)}</span>` : ''}
       </button>
-      <button type="button" class="fd-star ${isMine(f) ? 'on' : ''}" title="${f.custom ? 'Delete this custom filament' : isMine(f) ? 'Remove from my filaments' : 'Add to my filaments'}">${f.custom ? '✕' : isMine(f) ? '★' : '☆'}</button>`;
-    const [pick, star] = li.querySelectorAll('button');
+      ${
+        f.stock
+          ? `<span class="fd-star fd-stock" title="On hand in Spoolman (manage it there)">●</span>`
+          : `<button type="button" class="fd-star ${isMine(f) ? 'on' : ''}" title="${f.custom ? 'Delete this custom filament' : isMine(f) ? 'Remove from my filaments' : 'Add to my filaments'}">${f.custom ? '✕' : isMine(f) ? '★' : '☆'}</button>`
+      }`;
+    const [pick, star] = li.querySelectorAll('button') as unknown as [HTMLButtonElement, HTMLButtonElement | undefined];
     if (opts.onPick) {
       pick.addEventListener('click', () => {
         opts.onPick?.(f);
         d.close();
       });
     } else pick.addEventListener('click', () => (toggleMine(f), renderList()));
-    star.addEventListener('click', () => (toggleMine(f), renderList()));
+    star?.addEventListener('click', () => (toggleMine(f), renderList()));
     ul.appendChild(li);
   }
   const total = scored.length;
   d.querySelector('.fd-count')!.textContent =
     total === 0
       ? prefs.onlyMine
-        ? 'No matching filaments in your list. Untick "Only my filaments" to browse the library and star the spools you own.'
+        ? 'No matching filaments in your list. Untick "Only my filaments" to browse the library and star the spools you own' +
+          (stockState.info ? ', or add spools in Spoolman.' : '.')
         : 'No filaments match.'
       : `${total > MAX_ROWS ? `Showing the ${MAX_ROWS} ${target ? 'closest' : 'first'} of ${total}` : `${total} filament${total === 1 ? '' : 's'}`}` +
-        `${target ? ', closest color first' : ''}. ★ = in my filaments (${myFilamentCount()}).`;
+        `${target ? ', closest color first' : ''}. ${stock.length ? '● = on hand in Spoolman, ' : ''}★ = in my filaments (${myFilamentCount()}).`;
 }
 
 /** Open the filament picker (pick mode with onPick, otherwise "manage my filaments"). */
@@ -232,14 +335,16 @@ export async function openFilamentPicker(o: PickerOptions): Promise<void> {
   d.querySelector('.fd-list')!.innerHTML = '';
   if (!d.open) d.showModal();
   try {
-    await ensureLibrary();
+    await Promise.all([ensureLibrary(), loadStock(false)]);
   } catch {
     d.querySelector('.fd-count')!.textContent = 'Could not load the filament library.';
     return;
   }
+  void renderSpoolman();
   mine = loadMyFilaments();
-  const materials = countSorted(library.map((f) => f.material));
-  const brands = [...new Set(library.map((f) => f.brand))].sort((a, b) => a.localeCompare(b));
+  const all = [...stock, ...library];
+  const materials = countSorted(all.map((f) => f.material));
+  const brands = [...new Set(all.map((f) => f.brand))].sort((a, b) => a.localeCompare(b));
   fillSelect(d.querySelector('.fd-material')!, 'All materials', materials, prefs.material);
   fillSelect(d.querySelector('.fd-brand')!, 'All brands', brands, prefs.brand);
   d.querySelector<HTMLInputElement>('.fd-mine')!.checked = prefs.onlyMine;

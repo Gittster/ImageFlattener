@@ -10,7 +10,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:server": "VITE_SELF_HOSTED=1 vite build",
     "preview": "vite preview",
+    "serve": "node server/server.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

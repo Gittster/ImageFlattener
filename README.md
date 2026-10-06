@@ -9,7 +9,7 @@ Turn a raster image into:
 2. a **layered SVG in real millimetres**, ready for multi-color 3D printing (one shape per filament color), and
 3. a **ready-to-slice 3MF for Bambu Studio** with one solid part per color and the filament colors pre-assigned.
 
-Everything runs in your browser. The image is never uploaded anywhere; there is no backend.
+Everything runs in your browser. The image is never uploaded anywhere; there is no backend. You can also [self-host it](#self-hosting-docker--synology-nas) on a NAS, which adds project storage and your [Spoolman](https://github.com/Donkie/Spoolman) inventory.
 
 **Live app:** `https://<user>.github.io/<repo>/`. For this repository that is
 <https://gittster.github.io/ImageFlattener/>.
@@ -73,7 +73,7 @@ Clustering happens in **CIELAB**, so colors are grouped by perceived similarity.
 * **Merge selected:** tick two or more swatches and merge them into one color (the pixel-weighted Lab average).
 * **Reset** undoes merges and overrides.
 * **Spool button (per color): pick a real filament.** This opens the filament library, sorted by how close each filament is to that color. Closeness is measured with CIEDE2000 ΔE: under 2 is hard to tell apart; over 10 is a clearly different color. You can filter by material and brand and search by name. Choosing a filament makes the preview and every export use its color, and the 3MF parts are named after it.
-* **My filaments…**: star (☆) the spools you own. You can also add **custom filaments**, for brands not in the library or a color you measured from your own spool. The list is saved in your browser.
+* **My filaments…**: star (☆) the spools you own. You can also add **custom filaments**, for brands not in the library or a color you measured from your own spool. The list is saved in your browser (and on the server when self-hosted). When self-hosted with Spoolman, your spools on hand are included automatically.
 * **Match to my filaments**: gives every color its closest filament from your list. Each filament is used at most once while there are enough (an optimal assignment, not just "nearest each"), so two similar colors don't collapse onto the same spool. If you have fewer filaments than colors, some colors share one and the app tells you.
 * **Force darkest/lightest to pure black/white** pins those two clusters to `#000000` and `#FFFFFF` unless you've overridden them.
 
@@ -154,6 +154,7 @@ How edits behave:
 * **Open project…** restores it, or drop the file onto the app. Clustering is seeded, so the same image and settings reproduce the same colors, and the result matches what you saved.
 * The file is a ZIP containing `project.json`, the image and `edits.bin`, so it is easy to inspect.
 * Your "My filaments" list is stored in the browser, not in projects.
+* **Self-hosted:** Save project stores the project on the server; Open project… lists the saved projects, with Download and Delete, and still offers "Open from this computer…". Save project then saves back to the open project.
 
 ## Importing into a slicer
 
@@ -233,6 +234,67 @@ The app works under any subpath:
 * There are no runtime CDN dependencies (the ZIP library, fflate, is bundled), so the app keeps working offline once loaded.
 * `public/.nojekyll` stops GitHub Pages from running Jekyll.
 
+## Self-hosting (Docker / Synology NAS)
+
+The Docker image runs the same app plus a small server (`server/server.mjs`, Node, no dependencies) that adds:
+
+* **Project storage:** projects are saved in the container's `/data` folder, so every device on your network sees the same projects.
+* **Shared "My filaments":** your starred and custom filaments are kept on the server too.
+* **Spoolman:** the spools you have on hand in [Spoolman](https://github.com/Donkie/Spoolman) appear in "My filaments" (● in the picker, with remaining weight, spool count and location), and **Match my filaments** picks from them.
+  * Spools of the same Spoolman filament are combined. Empty and archived spools, and filaments without a color, are skipped. Multicolor filaments use their first color.
+  * The server only *reads* from Spoolman: it relays `GET` requests to Spoolman's `/api/v1/…`. The browser can't call Spoolman directly, because Spoolman doesn't allow cross-origin requests by default.
+
+Images are still processed in your browser.
+
+### Synology (Container Manager)
+
+1. In **File Station**, create the folder `docker/imageflattener` (on `volume1`).
+2. In **Container Manager → Project → Create**, choose that folder as the path, pick **Create docker-compose.yml**, and paste [`docker-compose.yml`](docker-compose.yml):
+
+   ```yaml
+   services:
+     imageflattener:
+       image: ghcr.io/gittster/imageflattener:latest
+       container_name: imageflattener
+       restart: unless-stopped
+       ports:
+         - "8090:8080"
+       environment:
+         SPOOLMAN_URL: "http://theplace.local:7912"
+       volumes:
+         - /volume1/docker/imageflattener:/data
+   ```
+3. Start the project and open `http://<your-nas>:8090`.
+
+**If Spoolman shows "can't resolve theplace.local":** names ending in `.local` are resolved by mDNS, which Docker containers usually can't do. Use the IP address of the machine running Spoolman instead (e.g. `http://192.168.1.20:7912`). Either change `SPOOLMAN_URL`, or click **My filaments… → Spoolman URL…** in the app (saved in `/data/config.json`; leave it empty to go back to `SPOOLMAN_URL`). If Spoolman runs on the same NAS, the NAS's own LAN IP works.
+
+**Settings (environment variables):**
+
+| Variable | Default | |
+| --- | --- | --- |
+| `SPOOLMAN_URL` | (none) | Spoolman's address, as you open it in the browser. Can be overridden in the app. |
+| `PORT` | `8080` | Port inside the container. |
+| `DATA_DIR` | `/data` | Where projects (`projects/*.ifproj`), shared state (`state/`) and `config.json` are stored. |
+| `BASIC_AUTH` | (none) | `user:password` to require a login. There is no login by default, so only run it on your home network (don't forward the port to the internet). |
+
+The container runs as root, so it can write to the mapped folder whatever its owner. To run it as your own user instead, add `user: "1026:100"` (your DSM user's uid:gid). The app warns if `/data` isn't writable.
+
+### Image
+
+`.github/workflows/docker.yml` publishes `ghcr.io/gittster/imageflattener` (`latest`, plus a tag per commit) for `linux/amd64`, `linux/arm64` and `linux/arm/v7` on every push to `main`. New GitHub packages are private: once, open the package on GitHub (**Packages → imageflattener → Package settings**) and set its visibility to **Public**, or log the NAS into `ghcr.io` with a token that has `read:packages`.
+
+To build it yourself instead, put this repository in the folder and replace `image:` with `build: .` (or run `docker build -t imageflattener .`).
+
+### Running the server without Docker
+
+```sh
+npm ci
+npm run build:server        # the app with server features enabled
+SPOOLMAN_URL=http://192.168.1.20:7912 npm run serve   # http://localhost:8080, data in ./data
+```
+
+`npm run build` (used for GitHub Pages) never contacts a server, so the static site is unchanged.
+
 ## Project layout
 
 ```
@@ -250,12 +312,16 @@ src/
     model3d.ts     height bands and one extruded part per color
     threemf.ts     3MF package writer (color group + one part per color)
     filaments.ts   filament library parsing, CIEDE2000 matching, optimal assignment
+    spoolman.ts    Spoolman spools -> filaments on hand
   data/          bundled SpoolmanDB filament colors (generated by scripts/build-filaments.mjs)
-  filamentPicker.ts  filament picker / "My filaments" dialog
+  filamentPicker.ts  filament picker / "My filaments" dialog (incl. Spoolman stock)
+  server.ts      client for the self-hosted server (config, projects, state, Spoolman)
+  projectsDialog.ts  projects stored on the server
   paint.ts       brush / eraser tool on the preview (edit layer in core/edits.ts)
   project.ts     .ifproj save / load
   worker.ts      cached pipeline running in a Web Worker
   main.ts        UI
+server/          self-hosting server (static files, /data storage, Spoolman relay) + its tests
 samples/         sample images (bundled via ?url imports)
 tests/           Vitest unit tests
 ```

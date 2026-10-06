@@ -2,7 +2,7 @@ import { deltaE2000, hexToRgb, rgbToLab, type Lab } from './color';
 
 /** A real filament color (from the bundled SpoolmanDB table or user-defined). */
 export interface Filament {
-  /** Stable id: "db:<brand>|<material>|<name>|<hex>" or "custom:<n>". */
+  /** Stable id: "db:<brand>|<material>|<name>|<hex>", "custom:<n>" or "spoolman:<filament id>". */
   id: string;
   brand: string;
   material: string;
@@ -15,6 +15,19 @@ export interface Filament {
   matte?: boolean;
   silk?: boolean;
   custom?: boolean;
+  /** Filament on hand, from Spoolman. */
+  stock?: FilamentStock;
+}
+
+export interface FilamentStock {
+  source: 'spoolman';
+  filamentId: number;
+  spools: number;
+  /** Total remaining weight in grams; null if Spoolman doesn't know. */
+  remainingG: number | null;
+  locations: string[];
+  /** All colors of a multicolor filament (hex is the first). */
+  colors?: string[];
 }
 
 /** The compact table produced by scripts/build-filaments.mjs. */

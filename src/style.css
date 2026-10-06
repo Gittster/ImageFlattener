@@ -268,3 +268,21 @@ dialog.filament-dialog::backdrop { background: rgba(0,0,0,.45); }
   border: 1.5px solid #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.7), inset 0 0 0 1px rgba(0,0,0,.4);
 }
 .brush-cursor.eraser { border-style: dashed; }
+
+/* Spoolman bar in the filament dialog */
+.fd-spoolman { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 16px; border-top: 1px solid var(--border); font-size: 13px; }
+.fd-spoolman .spacer { flex: 1; }
+.fd-sm-status { color: var(--muted); }
+.fd-sm-status.error { color: var(--danger); }
+.fd-sm-form { flex-basis: 100%; flex-wrap: wrap; gap: 8px; }
+.fd-sm-form input { flex: 1 1 220px; min-width: 0; }
+.fd-sm-hint { flex-basis: 100%; }
+.fd-stock { display: inline-flex; align-items: center; justify-content: center; color: var(--accent); font-size: 14px; cursor: default; }
+
+/* Server projects dialog */
+.pd-save { padding: 12px 16px 0; gap: 8px; }
+.pd-save input { flex: 1; min-width: 0; }
+.pd-status { padding: 0 16px; min-height: 18px; }
+.pd-list li { padding-right: 6px; gap: 6px; }
+.pd-list .pd-empty { padding: 16px 10px; }
+.pd-list .pd-dl, .pd-list .pd-del { flex: none; }

@@ -11,7 +11,10 @@ import { hexLab } from './core/filaments';
 import { PaintController, type Tool } from './paint';
 import { buildProject, isProjectFile, PROJECT_EXTENSION, readProject, type ProjectDoc } from './project';
 import { assignFilaments, filamentDistance } from './core/filaments';
-import { filamentLabel, getMyFilaments, myFilamentCount, openFilamentPicker } from './filamentPicker';
+import { filamentLabel, getMyFilaments, loadStock, myFilamentCount, openFilamentPicker, spoolmanStatus } from './filamentPicker';
+import { syncMyFilamentsWithServer } from './myFilaments';
+import { openProjectsDialog } from './projectsDialog';
+import { saveServerProject, serverConfig } from './server';
 
 const escHtml = (s: string): string => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!);
 const escAttr = (s: string): string => escHtml(s).replace(/"/g, '&quot;');
@@ -71,6 +74,7 @@ app.innerHTML = `
       </div>
       <label class="check" style="margin-top:8px"><input id="force-bw" type="checkbox" /> Pin darkest/lightest to black/white</label>
       <div class="hint">Swatch: override the color · spool: pick a real filament. Neither changes which pixels belong to a color.</div>
+      <div id="spoolman-info" class="status" hidden></div>
     </details>
     <details class="sec" data-sec="layers" open>
       <summary><span>Layers</span><span class="sum" id="sum-layers"></span></summary>
@@ -226,7 +230,7 @@ app.innerHTML = `
     </div>
   </main>
 </div>
-<footer class="foot">Your images are processed locally in your browser and never uploaded.</footer>
+<footer class="foot" id="foot">Your images are processed locally in your browser and never uploaded.</footer>
 `;
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -426,10 +430,13 @@ const SETTINGS_KEYS = [
   'baseMm', 'stepMm', 'cutoutMm', 'orientation', 'backing', 'backingMm', 'backingChoice', 'backingCustom', 'view',
 ] as const;
 
-async function saveProject(): Promise<void> {
+/** Name of the server project that is open (null: not opened from / saved to the server). */
+let serverProjectName: string | null = null;
+
+async function projectBlob(): Promise<Blob | null> {
   const img = state.image;
   const r = state.result;
-  if (!img) return;
+  if (!img) return null;
   const settings: Record<string, unknown> = {};
   for (const k of SETTINGS_KEYS) settings[k] = state[k];
   const blob = await buildProject(
@@ -447,10 +454,40 @@ async function saveProject(): Promise<void> {
     img.blob,
     paint.edits && hasEdits(paint.edits) ? { data: paint.edits, width: img.working.width, height: img.working.height } : null,
   );
-  downloadBlob(blob, `${baseName(img.name)}${PROJECT_EXTENSION}`);
+  return blob;
 }
 
-async function loadProjectFile(file: Blob): Promise<void> {
+async function saveProject(): Promise<void> {
+  const img = state.image;
+  if (!img) return;
+  const server = await serverConfig();
+  if (server?.storage.ok) {
+    // Save straight back to the open server project; otherwise ask for a name.
+    if (serverProjectName) return saveToServer(serverProjectName);
+    return openServerProjects();
+  }
+  const blob = await projectBlob();
+  if (blob) downloadBlob(blob, `${baseName(img.name)}${PROJECT_EXTENSION}`);
+}
+
+async function saveToServer(name: string): Promise<void> {
+  const blob = await projectBlob();
+  if (!blob) return;
+  const saved = await saveServerProject(name, blob);
+  serverProjectName = saved.name;
+  setStatus(`Saved "${saved.name.replace(/\.ifproj$/i, '')}" on the server.`);
+}
+
+function openServerProjects(): Promise<void> {
+  return openProjectsDialog({
+    saveName: state.image ? (serverProjectName ?? baseName(state.image.name)) : null,
+    save: saveToServer,
+    open: (blob, name) => loadProjectFile(blob, name),
+    openLocal: () => $<HTMLInputElement>('project-input').click(),
+  });
+}
+
+async function loadProjectFile(file: Blob, serverName: string | null = null): Promise<void> {
   try {
     const p = await readProject(file);
     const st = state as unknown as Record<string, unknown>;
@@ -463,7 +500,8 @@ async function loadProjectFile(file: Blob): Promise<void> {
       palette: p.doc.palette,
       edits: p.edits && p.doc.edits ? { data: p.edits, width: p.doc.edits.width, height: p.doc.edits.height } : null,
     });
-    setStatus(`Opened project "${p.doc.image.name}".`);
+    serverProjectName = serverName;
+    setStatus(serverName ? `Opened "${serverName.replace(/\.ifproj$/i, '')}" from the server.` : `Opened project "${p.doc.image.name}".`);
   } catch (err) {
     setStatus(err instanceof Error ? err.message : String(err), 'error');
   }
@@ -1221,8 +1259,28 @@ const setBlur = bindRange('blur', (v) => (v === 0 ? 'off' : `${v} px`), (v) => (
 function updateMyFilamentsButton(): void {
   const n = myFilamentCount();
   $('my-filaments-btn').textContent = n ? `My filaments (${n})…` : 'My filaments…';
+  const sm = spoolmanStatus();
+  const info = $('spoolman-info');
+  info.hidden = !sm;
+  info.classList.toggle('error', !!sm?.error);
+  if (sm) info.textContent = sm.error ? `Spoolman: ${sm.error}` : `Spoolman: ${sm.count} filament${sm.count === 1 ? '' : 's'} on hand, included in my filaments.`;
 }
 updateMyFilamentsButton();
+
+// Self-hosted server (Docker): projects and "My filaments" live on the server,
+// and Spoolman's spools count as filaments on hand.
+void serverConfig().then(async (c) => {
+  if (!c) return;
+  document.body.classList.add('has-server');
+  $('foot').textContent = 'Images are processed in your browser. Projects you save are stored on your server, nowhere else.';
+  if (c.storage.ok) {
+    $('open-project-btn').title = 'Open a project saved on the server (or from this computer)';
+    $('save-project-btn').title = 'Save image, settings, palette, filaments and brush edits on the server';
+  } else if (c.storage.error) setStatus(c.storage.error, 'warn');
+  await syncMyFilamentsWithServer();
+  await loadStock(false);
+  updateMyFilamentsButton();
+});
 
 $('my-filaments-btn').addEventListener('click', () => {
   void openFilamentPicker({ onMineChange: updateMyFilamentsButton });
@@ -1233,7 +1291,9 @@ $('match-mine-btn').addEventListener('click', async () => {
   if (mine.length === 0) {
     void openFilamentPicker({
       onMineChange: updateMyFilamentsButton,
-      notice: 'Your filament list is empty. Star (☆) the spools you own, or add custom ones below, then use "Match to my filaments" again.',
+      notice: spoolmanStatus()?.error
+        ? `Spoolman: ${spoolmanStatus()!.error} Meanwhile you can star (☆) spools or add custom ones below.`
+        : 'Your filament list is empty. Star (☆) the spools you own, or add custom ones below, then use "Match to my filaments" again.',
     });
     return;
   }
@@ -1477,6 +1537,7 @@ $('reseed-btn').addEventListener('click', () => {
 // ------------------------------------------------------------- loading ----
 async function openBlob(blob: Blob, name: string, restore: Restore | null = null): Promise<void> {
   state.loading = true;
+  serverProjectName = null;
   state.result = null;
   // A new image starts without brush edits (a project restores its own).
   paint.reset();
@@ -1534,7 +1595,10 @@ function openFile(file: File): Promise<void> {
 $('save-project-btn').addEventListener('click', () => {
   saveProject().catch((err) => setStatus(err instanceof Error ? err.message : String(err), 'error'));
 });
-$('open-project-btn').addEventListener('click', () => $<HTMLInputElement>('project-input').click());
+$('open-project-btn').addEventListener('click', async () => {
+  if ((await serverConfig())?.storage.ok) void openServerProjects();
+  else $<HTMLInputElement>('project-input').click();
+});
 $<HTMLInputElement>('project-input').addEventListener('change', (e) => {
   const input = e.target as HTMLInputElement;
   const file = input.files?.[0];
